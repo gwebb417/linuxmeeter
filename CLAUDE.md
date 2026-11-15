@@ -61,9 +61,17 @@ set by the harness script — a bare `cargo test -- --ignored` fails fast rather
 creating real devices in the developer's own audio session. Because they share one
 daemon and one process environment, they run with `--test-threads=1`.
 
-Without a session manager nothing configures ports, so the harness sets
-`adapter.auto-port-config` for both the daemon's null sink and this process's streams.
-Without that, every node appears with zero ports and no link can ever form.
+Without a session manager nothing configures ports; without that, every node appears
+with zero ports and no link can ever form. The harness's null sink uses
+`adapter.auto-port-config`, with `audio.format`/`rate`/`channels` pinned: PipeWire 1.4.x
+parses the follower's EnumFormat before fixating it, so any unfixed field reads as 0 and
+the PortConfig is rejected (the sink silently stays in convert mode with one `UNK` port).
+Our own streams can't use that trick — filter-chain never puts a rate in its EnumFormat —
+so the harness exports `LM_TEST_NO_SESSION_MANAGER=1` and the rig's `PortConfigurator`
+sets a full DSP PortConfig on every `lm.*` node as it appears, as WirePlumber would. It
+runs on its **own** core connection: the daemon stops reading a client that set a node
+param until that node syncs, so setting it from the connection that owns the node
+(the tone, the meter taps) deadlocks silently.
 
 **Manual.** Perceptual quality, real hardware enumeration, and WirePlumber policy
 interactions are still eyes-and-ears work: `make graph` / `make spike` plus `pw-dump`,

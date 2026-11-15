@@ -53,6 +53,122 @@ struct State {
     nodes: HashMap<String, Node>,
 }
 
+/// Stands in for the session manager the private daemon doesn't have.
+///
+/// Nothing else switches our streams' adapters into DSP mode, so they never
+/// grow per-channel ports and can't be linked. On PipeWire 1.4.x
+/// `adapter.auto-port-config` can't do it either — it derives the format from
+/// the follower's EnumFormat, and filter-chain never puts a rate there — so do
+/// what WirePlumber does: set a complete PortConfig (dsp, F32P/48k/stereo) on
+/// every lm.* node as it appears, before anything links it.
+///
+/// It must be its own client. Setting a param on a node makes the daemon stop
+/// reading the setter's socket until that node has synced; the tone and meter
+/// streams live on the rig's connection, so doing this from the rig's own core
+/// waits on itself forever (the connection just goes silent).
+struct PortConfigurator {
+    _core: CoreRc,
+    _registry: pipewire::registry::RegistryRc,
+    _listener: pipewire::registry::Listener,
+    _configured: Rc<RefCell<HashMap<u32, Node>>>,
+}
+
+impl PortConfigurator {
+    /// `None` unless the harness says there is no session manager; against a
+    /// real session WirePlumber already does this and we must keep out of it.
+    fn new(context: &ContextRc) -> Option<Self> {
+        if std::env::var("LM_TEST_NO_SESSION_MANAGER").ok().as_deref() != Some("1") {
+            return None;
+        }
+        let core = context.connect_rc(None).expect("second connection for port config");
+        let registry = core.get_registry_rc().expect("registry");
+        let configured: Rc<RefCell<HashMap<u32, Node>>> = Rc::default();
+        let listener = {
+            let added = configured.clone();
+            let removed = configured.clone();
+            let registry_weak = registry.downgrade();
+            registry
+                .add_listener_local()
+                .global(move |global| {
+                    if global.type_ != ObjectType::Node {
+                        return;
+                    }
+                    let Some(props) = global.props else { return };
+                    let name = props.get("node.name").unwrap_or("");
+                    let class = props.get("media.class").unwrap_or("");
+                    let wanted = matches!(
+                        class,
+                        "Audio/Sink" | "Audio/Source" | "Stream/Input/Audio" | "Stream/Output/Audio"
+                    );
+                    if !name.starts_with("lm.") || !wanted {
+                        return;
+                    }
+                    let Some(registry) = registry_weak.upgrade() else { return };
+                    let Ok(node) = registry.bind::<Node, _>(global) else { return };
+                    let bytes = dsp_port_config(class);
+                    let pod = libspa::pod::Pod::from_bytes(&bytes).expect("valid PortConfig pod");
+                    node.set_param(libspa::param::ParamType::PortConfig, 0, pod);
+                    // Keep the proxy until the node goes, so the param isn't
+                    // raced by the proxy's own destruction.
+                    added.borrow_mut().insert(global.id, node);
+                })
+                .global_remove(move |id| {
+                    removed.borrow_mut().remove(&id);
+                })
+                .register()
+        };
+        Some(Self { _core: core, _registry: registry, _listener: listener, _configured: configured })
+    }
+}
+
+fn dsp_port_config(media_class: &str) -> Vec<u8> {
+    use libspa::pod::{Object, Property, PropertyFlags, Value};
+    use libspa::utils::Id;
+
+    // The adapter's direction: sinks and capture streams take input.
+    let direction = if media_class.contains("Sink") || media_class.contains("Input") {
+        libspa::sys::SPA_DIRECTION_INPUT
+    } else {
+        libspa::sys::SPA_DIRECTION_OUTPUT
+    };
+
+    let mut info = libspa::param::audio::AudioInfoRaw::new();
+    info.set_format(libspa::param::audio::AudioFormat::F32P);
+    info.set_rate(RATE);
+    info.set_channels(2);
+    let mut position = [0u32; libspa::sys::SPA_AUDIO_MAX_CHANNELS as usize];
+    position[0] = libspa::sys::SPA_AUDIO_CHANNEL_FL;
+    position[1] = libspa::sys::SPA_AUDIO_CHANNEL_FR;
+    info.set_position(position);
+
+    let prop = |key, value| Property { key, flags: PropertyFlags::empty(), value };
+    let obj = Value::Object(Object {
+        type_: libspa::sys::SPA_TYPE_OBJECT_ParamPortConfig,
+        id: libspa::sys::SPA_PARAM_PortConfig,
+        properties: vec![
+            prop(libspa::sys::SPA_PARAM_PORT_CONFIG_direction, Value::Id(Id(direction))),
+            prop(
+                libspa::sys::SPA_PARAM_PORT_CONFIG_mode,
+                Value::Id(Id(libspa::sys::SPA_PARAM_PORT_CONFIG_MODE_dsp)),
+            ),
+            prop(libspa::sys::SPA_PARAM_PORT_CONFIG_monitor, Value::Bool(false)),
+            prop(libspa::sys::SPA_PARAM_PORT_CONFIG_control, Value::Bool(false)),
+            prop(
+                libspa::sys::SPA_PARAM_PORT_CONFIG_format,
+                Value::Object(Object {
+                    type_: libspa::sys::SPA_TYPE_OBJECT_Format,
+                    id: libspa::sys::SPA_PARAM_Format,
+                    properties: info.into(),
+                }),
+            ),
+        ],
+    });
+    libspa::pod::serialize::PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &obj)
+        .expect("serialize PortConfig")
+        .0
+        .into_inner()
+}
+
 /// A PipeWire client with a graph model, a link reconciler, and whatever
 /// modules/taps/streams a test has created. Everything lives on one main loop.
 struct Rig {
@@ -63,6 +179,7 @@ struct Rig {
     modules: Vec<LoadedModule>,
     taps: Vec<MeterTap>,
     tones: Vec<Tone>,
+    _port_config: Option<PortConfigurator>,
     /// The registry proxy must outlive its listener — dropping it silently
     /// unsubscribes and the graph model stays empty forever.
     _registry: pipewire::registry::RegistryRc,
@@ -141,6 +258,7 @@ impl Rig {
                 .register()
         };
 
+        let port_config = PortConfigurator::new(&context);
         let rig = Self {
             mainloop,
             context,
@@ -149,6 +267,7 @@ impl Rig {
             modules: Vec::new(),
             taps: Vec::new(),
             tones: Vec::new(),
+            _port_config: port_config,
             _registry: registry,
             _reg_listener: reg_listener,
         };
@@ -438,6 +557,43 @@ fn strip_module_appears_and_vanishes() {
         Vec::<String>::new(),
         "unloading must leave zero lm.* nodes behind"
     );
+}
+
+/// filter-chain unloads itself when one of its streams loses its node (or its
+/// daemon connection drops). Dropping our handle afterwards must not destroy
+/// the module a second time — that was a use-after-free (heap corruption
+/// aborts in pw_impl_module_destroy).
+#[test]
+#[ignore = "requires a PipeWire daemon; run with `make test-audio`"]
+fn module_that_unloaded_itself_is_not_destroyed_twice() {
+    let mut rig = Rig::new();
+    let s = strip(1);
+
+    rig.load(&virtual_strip_args(&s.node_base(), &s.label, false));
+    rig.settle(400);
+    assert!(rig.modules[0].is_loaded());
+
+    // Kill the strip's output stream node from outside, as `pw-cli destroy`
+    // (or a misbehaving session manager) might.
+    let id = rig
+        .state
+        .borrow()
+        .model
+        .node_by_name(&s.out_node())
+        .expect("strip output node exists")
+        .id;
+    rig._registry.destroy_global(id).into_result().expect("destroy strip output node");
+    rig.settle(400);
+
+    assert!(!rig.modules[0].is_loaded(), "filter-chain should have unloaded itself");
+    assert_eq!(
+        rig.node_names_starting_with("lm."),
+        Vec::<String>::new(),
+        "a self-unloaded module must still leave zero lm.* nodes behind"
+    );
+
+    rig.modules.clear(); // must be a no-op now, not a second destroy
+    rig.settle(100);
 }
 
 /// B buses are the virtual microphones other apps select.

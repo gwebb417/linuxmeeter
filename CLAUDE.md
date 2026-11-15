@@ -140,6 +140,32 @@ the capture-side node (`.cap` for hardware strips, the sink node itself for virt
 Every `lm.*` node sets `state.restore-props: false`; without it WirePlumber's
 restore-stream overwrites our volumes and mutes as nodes appear.
 
+### VBAN (network audio)
+
+Both directions are PipeWire's own modules (`libpipewire-module-vban-send` /
+`-vban-recv`, PipeWire ≥ 0.3.76), loaded in-process through `LoadedModule` like the
+filter-chains. Args are built in `filterchain.rs`; every VBAN stream is
+`node.autoconnect=false` and linked by our `LinkManager`, never by WirePlumber.
+
+- **Send** is per bus (`BusState.vban`): one module, node `lm.bus.<id>.vban`, fed by a
+  route from `tap_node()` (post-limiter). Toggling or editing it is a module reload.
+  `destination.ip` must be an IP literal — the module uses `inet_pton`, not DNS.
+- **Receive** is a strip kind, `StripKind::Vban`: a gate→comp→EQ filter-chain whose
+  input is a hidden `Stream/Input/Audio` (`lm.strip.<id>`, also its `control_node`)
+  plus a route from the receiver stream `lm.strip.<id>.vban`. `online` tracks that
+  stream's existence. VBAN strips are the only strips that can be added/removed at
+  runtime, which is why `strip_taps` is `Vec<Option<MeterTap>>`, index-aligned with
+  `app.strips`.
+- **One receiver per UDP port** (only one socket can own it), serving every VBAN strip
+  on that port. PipeWire ≥ 1.4 creates a stream per incoming session and applies our
+  `stream.rules` (match `sess.name` + optional `vban.ip`, name the node after the
+  strip). Older versions ignore rules and make one stream up front from `stream.props`,
+  which carries the *first* strip's identity — so pre-1.4 it's one stream per port, and
+  the engine warns. `vban_conflict` rejects two strips whose rules would both match one
+  session.
+- Invalid configs are rejected in the engine (`VbanSend/VbanRecv::validated`) and
+  surfaced via `EngineEvent::Error` → `engine_error` → `mixer.notice`.
+
 ### Metering
 
 One `MeterTap` per metered point — a passive, non-autoconnecting F32 capture stream

@@ -3,7 +3,32 @@
 export type BusId = "A1" | "A2" | "B1" | "B2";
 export const BUS_IDS: BusId[] = ["A1", "A2", "B1", "B2"];
 
-export type StripKind = "virtual" | "hardware";
+export type StripKind = "virtual" | "hardware" | "vban";
+
+export const VBAN_DEFAULT_PORT = 6980;
+export const VBAN_STREAM_NAME_MAX = 16;
+export const VBAN_RATES = [44100, 48000, 96000] as const;
+
+/** Incoming VBAN stream feeding a "vban" strip. */
+export interface VbanRecv {
+  /** Only this stream name is accepted (PipeWire ≥ 1.4). */
+  streamName: string;
+  /** Local UDP port to listen on. */
+  port: number;
+  /** Only accept packets from this sender; "" = any. */
+  senderIp: string;
+  latencyMs: number;
+}
+
+/** Outgoing VBAN stream carrying a bus's post-limiter mix. */
+export interface VbanSend {
+  enabled: boolean;
+  streamName: string;
+  /** Literal IP address (PipeWire does not resolve hostnames). */
+  host: string;
+  port: number;
+  rate: number;
+}
 
 export interface GateParams {
   enabled: boolean;
@@ -56,6 +81,8 @@ export interface StripState {
   gate: GateParams;
   comp: CompParams;
   eq: EqParams;
+  /** Receiver config; non-null exactly for "vban" strips. */
+  vban: VbanRecv | null;
 }
 
 export interface BusState {
@@ -66,6 +93,7 @@ export interface BusState {
   gainDb: number;
   mute: boolean;
   limiter: LimiterParams;
+  vban: VbanSend;
 }
 
 export interface DeviceInfo {

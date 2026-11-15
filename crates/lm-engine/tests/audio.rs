@@ -16,7 +16,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use lm_engine::filterchain::{bus_args, virtual_strip_args, LoadedModule};
+use lm_engine::filterchain::{
+    bus_args, vban_recv_args, vban_send_args, vban_strip_args, virtual_strip_args, LoadedModule, VbanRecvStream,
+};
 use lm_engine::links::LinkManager;
 use lm_engine::meter::{MeterAccum, MeterTap};
 use lm_engine::params;
@@ -175,6 +177,11 @@ impl Rig {
     fn load(&mut self, args: &str) {
         let module = LoadedModule::load(&self.context, "libpipewire-module-filter-chain", args)
             .expect("filter-chain module must load (is lsp-plugins-lv2 installed?)");
+        self.modules.push(module);
+    }
+
+    fn load_module(&mut self, name: &str, args: &str) {
+        let module = LoadedModule::load(&self.context, name, args).unwrap_or_else(|e| panic!("{name} must load: {e}"));
         self.modules.push(module);
     }
 
@@ -350,6 +357,7 @@ fn strip(id: u32) -> StripState {
         gate: Default::default(),
         comp: Default::default(),
         eq: Default::default(),
+        vban: None,
     };
     s.gain_db = 0.0;
     s
@@ -364,6 +372,7 @@ fn bus_a1() -> BusState {
         gain_db: 0.0,
         mute: false,
         limiter: LimiterParams::default(),
+        vban: Default::default(),
     }
 }
 
@@ -453,6 +462,7 @@ fn b_bus_appears_as_a_microphone() {
         gain_db: 0.0,
         mute: false,
         limiter: LimiterParams::default(),
+        vban: Default::default(),
     };
 
     rig.load(&bus_args(&b.node_base(), &b.label, None));
@@ -593,4 +603,137 @@ fn gate_threshold_opens_and_closes_the_signal() {
         "gate made little difference: closed {closed:.1} dBFS vs open {open:.1} dBFS"
     );
     assert!(open > -20.0, "gate never reopened (peak {open} dBFS)");
+}
+
+/// The VBAN transport alone, with no filter-chain in the path: tone ->
+/// vban-send -> 127.0.0.1 -> vban-recv -> meter. Isolates the network modules
+/// and our args for them (stream naming, rules, port) from the LSP DSP.
+#[test]
+#[ignore = "requires a PipeWire daemon; run with `make test-audio`"]
+fn vban_send_and_recv_round_trip_a_tone() {
+    const PORT: u16 = 6991;
+    let mut rig = Rig::new();
+    let send = lm_protocol::VbanSend {
+        enabled: true,
+        stream_name: "lmraw".into(),
+        host: "127.0.0.1".into(),
+        port: PORT,
+        rate: RATE,
+    };
+    let recv = VbanRecvStream {
+        node_name: "lm.test.vban-recv".into(),
+        label: "Raw".into(),
+        stream_name: "lmraw".into(),
+        sender_ip: String::new(),
+        latency_ms: 50,
+    };
+    // A second rule on the same port for a session nobody sends: it must not
+    // produce a node (and must not steal "lmraw").
+    let decoy = VbanRecvStream {
+        node_name: "lm.test.vban-decoy".into(),
+        label: "Decoy".into(),
+        stream_name: "nobody".into(),
+        sender_ip: String::new(),
+        latency_ms: 50,
+    };
+
+    rig.load_module("libpipewire-module-vban-recv", &vban_recv_args(PORT, &[recv.clone(), decoy]));
+    rig.load_module("libpipewire-module-vban-send", &vban_send_args("lm.test.vban-send", "Test", &send));
+    rig.settle(400);
+    assert!(rig.node_exists("lm.test.vban-send"), "sender stream did not appear");
+
+    rig.tone("lm.test.tone", 1000.0, 0.5);
+    rig.settle(200);
+    rig.route("lm.test.tone", "lm.test.vban-send", true);
+    // Meter taps are passive and do not make a node run; give the received
+    // stream a real consumer, as a VBAN strip's input is in the app.
+    rig.route(&recv.node_name, SINK, true);
+    let meter = rig.tap("test-vban-raw", &recv.node_name);
+    rig.settle(1500);
+
+    assert!(rig.node_exists(&recv.node_name), "receiver stream {} never appeared", recv.node_name);
+    if lm_engine::filterchain::vban_recv_has_rules(&pipewire_version()) {
+        assert!(!rig.node_exists("lm.test.vban-decoy"), "a rule for an absent session created a node");
+    }
+    let [peak, _, rms, _] = rig.measure(&meter, 600);
+    assert!((peak - -6.02).abs() < 2.0, "received peak {peak:.2} dBFS, expected about -6");
+    assert!((rms - -9.03).abs() < 2.0, "received rms {rms:.2} dBFS, expected about -9");
+
+    rig.modules.clear();
+    rig.settle(400);
+    assert!(rig.node_names_starting_with("lm.test.vban").is_empty(), "VBAN nodes must vanish with their modules");
+}
+
+fn pipewire_version() -> String {
+    // SAFETY: static NUL-terminated string.
+    unsafe { std::ffi::CStr::from_ptr(pipewire::sys::pw_get_library_version()) }.to_string_lossy().into_owned()
+}
+
+/// VBAN end to end over loopback UDP, using exactly the module args the
+/// engine builds: tone -> vban-send -> 127.0.0.1 -> vban-recv -> VBAN strip
+/// (gate/comp/EQ) -> meter. The receiver stream must carry the name the
+/// strip's route expects, on old (stream.props) and new (stream.rules)
+/// PipeWire alike, and the level must survive the S16 round trip.
+#[test]
+#[ignore = "requires a PipeWire daemon; run with `make test-audio`"]
+fn vban_loopback_reaches_a_vban_strip() {
+    const PORT: u16 = 6990; // not the default, to stay off any real VBAN traffic
+    let mut rig = Rig::new();
+    let mut s = strip(5);
+    s.kind = StripKind::Vban;
+    s.vban = Some(lm_protocol::VbanRecv { stream_name: "lmtest".into(), port: PORT, ..Default::default() });
+    let send = lm_protocol::VbanSend {
+        enabled: true,
+        stream_name: "lmtest".into(),
+        host: "127.0.0.1".into(),
+        port: PORT,
+        rate: RATE,
+    };
+
+    rig.want_control(&s.control_node());
+    rig.load(&vban_strip_args(&s.node_base(), &s.label));
+    rig.load_module(
+        "libpipewire-module-vban-recv",
+        &vban_recv_args(
+            PORT,
+            &[VbanRecvStream {
+                node_name: s.vban_node(),
+                label: s.label.clone(),
+                stream_name: "lmtest".into(),
+                sender_ip: String::new(),
+                latency_ms: 50,
+            }],
+        ),
+    );
+    rig.load_module("libpipewire-module-vban-send", &vban_send_args("lm.test.vban-send", "Test", &send));
+    rig.settle(400);
+
+    rig.tone("lm.test.tone", 1000.0, 0.5);
+    rig.settle(200);
+    rig.route("lm.test.tone", "lm.test.vban-send", true);
+    // The receiver stream may only appear once packets arrive (PipeWire >= 1.4);
+    // the route is by name, so it links whenever that happens.
+    rig.route(&s.vban_node(), &s.node_base(), true);
+    // Meter taps are passive; the strip output needs a real consumer to run,
+    // as it has in the app (a bus).
+    rig.route(&s.out_node(), SINK, true);
+    let meter = rig.tap("test-vban", &s.out_node());
+    rig.settle(1500);
+    make_transparent(&rig, &s.control_node());
+    rig.settle(300);
+
+    assert!(rig.node_exists(&s.vban_node()), "receiver stream {} never appeared", s.vban_node());
+    let [peak, _, rms, _] = rig.measure(&meter, 600);
+    assert!(
+        (peak - -6.02).abs() < 2.0,
+        "VBAN strip peak {peak:.2} dBFS, expected about -6; did packets make it through?"
+    );
+    assert!((rms - -9.03).abs() < 2.0, "VBAN strip rms {rms:.2} dBFS, expected about -9");
+
+    rig.modules.clear();
+    rig.settle(400);
+    assert!(
+        rig.node_names_starting_with("lm.strip").is_empty(),
+        "unloading must leave no VBAN or strip nodes behind"
+    );
 }

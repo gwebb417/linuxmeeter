@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use lm_protocol::{
     AppState, BusId, BusState, CompParams, DeviceInfo, EngineCommand, EngineEvent, EqParams,
-    GateParams, LimiterParams, StripId, StripKind, StripState, Target,
+    GateParams, LimiterParams, StripId, StripKind, StripState, Target, VbanRecv, VbanSend,
 };
 use pipewire::context::ContextRc;
 use pipewire::core::CoreRc;
@@ -23,7 +23,10 @@ use pipewire::node::Node;
 use pipewire::proxy::Listener as ProxyListener;
 use pipewire::types::ObjectType;
 
-use crate::filterchain::{bus_args, hardware_strip_args, virtual_strip_args, LoadedModule};
+use crate::filterchain::{
+    bus_args, hardware_strip_args, vban_recv_args, vban_recv_has_rules, vban_send_args, vban_strip_args,
+    virtual_strip_args, LoadedModule, VbanRecvStream,
+};
 use crate::links::LinkManager;
 use crate::meter::MeterTap;
 use crate::params;
@@ -57,7 +60,15 @@ struct Engine {
     links: LinkManager,
     strip_modules: HashMap<StripId, LoadedModule>,
     bus_modules: HashMap<BusId, LoadedModule>,
-    strip_taps: Vec<MeterTap>,
+    /// Outgoing VBAN stream per bus (only while enabled).
+    vban_send_modules: HashMap<BusId, LoadedModule>,
+    /// One VBAN receiver per UDP port, serving every VBAN strip on that port.
+    vban_recv_modules: HashMap<u16, LoadedModule>,
+    /// The running PipeWire's vban-recv supports `stream.rules` (≥ 1.4).
+    vban_rules: bool,
+    /// Index-aligned with `app.strips` (None if that tap failed to create),
+    /// so strips can be removed without shifting other strips' meters.
+    strip_taps: Vec<Option<MeterTap>>,
     bus_taps: Vec<MeterTap>,
     /// Control-node name -> bound proxy (Props target for volume/mute/DSP).
     nodes: HashMap<String, Node>,
@@ -79,6 +90,15 @@ impl Engine {
         self.refresh_devices();
         self.dirty = true;
         let _ = self.evt_tx.send(EngineEvent::State(self.app.clone()));
+    }
+
+    /// Surface a rejected command to the UI, then resend state so optimistic
+    /// frontend edits snap back to what the engine actually holds.
+    fn report(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        tracing::warn!("{msg}");
+        let _ = self.evt_tx.send(EngineEvent::Error(msg));
+        self.send_state();
     }
 
     fn save_now(&mut self) {
@@ -177,6 +197,7 @@ impl Engine {
                 gate: GateParams::default(),
                 comp: CompParams::default(),
                 eq: EqParams::default(),
+                vban: None,
             });
             next_id += 1;
         }
@@ -194,6 +215,7 @@ impl Engine {
                 gate: GateParams::default(),
                 comp: CompParams::default(),
                 eq: EqParams::default(),
+                vban: None,
             });
             next_id += 1;
         }
@@ -231,14 +253,9 @@ impl Engine {
         }
 
         // Meter taps (linked through the same reconciler).
-        for strip in &self.app.strips {
-            match MeterTap::new(self.core.clone(), &format!("s{}", strip.id)) {
-                Ok(tap) => {
-                    self.links.set_route(&strip.out_node(), &tap.node_name.clone(), true);
-                    self.strip_taps.push(tap);
-                }
-                Err(e) => tracing::warn!("strip tap failed: {e}"),
-            }
+        for strip in self.app.strips.clone() {
+            let tap = self.make_strip_tap(&strip);
+            self.strip_taps.push(tap);
         }
         for b in &self.app.buses {
             match MeterTap::new(self.core.clone(), &format!("b{:?}", b.id).to_lowercase()) {
@@ -248,6 +265,19 @@ impl Engine {
                 }
                 Err(e) => tracing::warn!("bus tap failed: {e}"),
             }
+        }
+
+        // VBAN: receivers (one per port) feeding VBAN strips, senders per bus.
+        for strip in &self.app.strips {
+            if strip.kind == StripKind::Vban {
+                self.links.set_route(&strip.vban_node(), &strip.node_base(), true);
+            }
+        }
+        for port in self.vban_ports() {
+            self.reload_vban_port(port);
+        }
+        for id in BusId::ALL {
+            self.apply_bus_vban(id);
         }
 
         self.built = true;
@@ -263,6 +293,7 @@ impl Engine {
     fn load_strip_module(&mut self, strip: &StripState) {
         let args = match (&strip.kind, &strip.hw_key) {
             (StripKind::Hardware, Some(hw)) => hardware_strip_args(&strip.node_base(), &strip.label, hw),
+            (StripKind::Vban, _) => vban_strip_args(&strip.node_base(), &strip.label),
             _ => virtual_strip_args(&strip.node_base(), &strip.label, false),
         };
         match LoadedModule::load(&self.context, "libpipewire-module-filter-chain", &args) {
@@ -302,6 +333,221 @@ impl Engine {
         self.bus_modules.remove(&id);
         self.load_bus_module(&b);
         self.reconcile();
+    }
+
+    fn make_strip_tap(&mut self, strip: &StripState) -> Option<MeterTap> {
+        match MeterTap::new(self.core.clone(), &format!("s{}", strip.id)) {
+            Ok(tap) => {
+                self.links.set_route(&strip.out_node(), &tap.node_name.clone(), true);
+                Some(tap)
+            }
+            Err(e) => {
+                tracing::warn!("strip tap failed: {e}");
+                None
+            }
+        }
+    }
+
+    // ---- VBAN ---------------------------------------------------------------
+
+    /// Distinct UDP ports any VBAN strip listens on.
+    fn vban_ports(&self) -> Vec<u16> {
+        let mut ports: Vec<u16> = self.app.strips.iter().filter_map(|s| s.vban.as_ref().map(|v| v.port)).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        ports
+    }
+
+    /// Two receivers whose rules both match one incoming session would each
+    /// claim it. Same port + same stream name overlaps unless both name a
+    /// sender and the senders differ.
+    fn vban_conflict(&self, except: Option<StripId>, cfg: &VbanRecv) -> Option<String> {
+        self.app
+            .strips
+            .iter()
+            .filter(|s| Some(s.id) != except)
+            .find(|s| {
+                s.vban.as_ref().is_some_and(|v| {
+                    v.port == cfg.port
+                        && v.stream_name == cfg.stream_name
+                        && (v.sender_ip.is_empty() || cfg.sender_ip.is_empty() || v.sender_ip == cfg.sender_ip)
+                })
+            })
+            .map(|s| format!("strip \"{}\" already receives \"{}\" on port {}", s.label, cfg.stream_name, cfg.port))
+    }
+
+    /// (Re)load the receiver for `port` so it serves exactly the VBAN strips
+    /// configured for it; unloads it when none are left. Node names are
+    /// stable, so routes into the strips re-link as the streams reappear.
+    fn reload_vban_port(&mut self, port: u16) {
+        self.vban_recv_modules.remove(&port); // drop unloads, freeing the socket
+        let streams: Vec<VbanRecvStream> = self
+            .app
+            .strips
+            .iter()
+            .filter_map(|s| {
+                let v = s.vban.as_ref().filter(|v| v.port == port && s.kind == StripKind::Vban)?;
+                Some(VbanRecvStream {
+                    node_name: s.vban_node(),
+                    label: s.label.clone(),
+                    stream_name: v.stream_name.clone(),
+                    sender_ip: v.sender_ip.clone(),
+                    latency_ms: v.latency_ms,
+                })
+            })
+            .collect();
+        if streams.is_empty() {
+            return;
+        }
+        if !self.vban_rules && streams.len() > 1 {
+            let msg = format!(
+                "PipeWire < 1.4 cannot split VBAN streams: everything arriving on port {port} goes to \"{}\"; give other VBAN strips their own port",
+                streams[0].label
+            );
+            let _ = self.evt_tx.send(EngineEvent::Error(msg.clone()));
+            tracing::warn!("{msg}");
+        }
+        match LoadedModule::load(&self.context, "libpipewire-module-vban-recv", &vban_recv_args(port, &streams)) {
+            Ok(m) => {
+                tracing::info!("VBAN receiver listening on UDP {port} ({} stream(s))", streams.len());
+                self.vban_recv_modules.insert(port, m);
+            }
+            Err(e) => {
+                let msg = format!("VBAN receiver on port {port} failed to start (port in use?): {e}");
+                let _ = self.evt_tx.send(EngineEvent::Error(msg.clone()));
+                tracing::error!("{msg}");
+            }
+        }
+    }
+
+    /// Start, restart, or stop a bus's outgoing VBAN stream to match its config.
+    fn apply_bus_vban(&mut self, id: BusId) {
+        let Some(b) = self.app.buses.iter().find(|b| b.id == id).cloned() else { return };
+        self.vban_send_modules.remove(&id);
+        self.links.set_route(&b.tap_node(), &b.vban_node(), b.vban.enabled);
+        if b.vban.enabled {
+            let args = vban_send_args(&b.vban_node(), &b.label, &b.vban);
+            match LoadedModule::load(&self.context, "libpipewire-module-vban-send", &args) {
+                Ok(m) => {
+                    tracing::info!(
+                        "VBAN {:?} -> {}:{} as \"{}\"",
+                        id,
+                        b.vban.host,
+                        b.vban.port,
+                        b.vban.stream_name
+                    );
+                    self.vban_send_modules.insert(id, m);
+                }
+                Err(e) => {
+                    let msg = format!("VBAN send for {} failed to start: {e}", b.label);
+                    let _ = self.evt_tx.send(EngineEvent::Error(msg.clone()));
+                    tracing::error!("{msg}");
+                }
+            }
+        }
+        self.reconcile();
+    }
+
+    fn add_vban_strip(&mut self, label: String, cfg: VbanRecv) {
+        let cfg = match cfg.validated() {
+            Ok(c) => c,
+            Err(e) => return self.report(format!("VBAN input: {e}")),
+        };
+        if let Some(e) = self.vban_conflict(None, &cfg) {
+            return self.report(format!("VBAN input: {e}"));
+        }
+        let id = self.app.strips.iter().map(|s| s.id).max().unwrap_or(0) + 1;
+        let label = match label.trim() {
+            "" => cfg.stream_name.clone(),
+            l => l.to_string(),
+        };
+        let strip = StripState {
+            id,
+            kind: StripKind::Vban,
+            label,
+            hw_key: None,
+            // Becomes true when the receiver's stream node appears (on
+            // PipeWire ≥ 1.4 that is when packets start arriving).
+            online: false,
+            gain_db: 0.0,
+            mute: false,
+            solo: false,
+            routes: routes(&[BusId::A1]),
+            gate: GateParams::default(),
+            comp: CompParams::default(),
+            eq: EqParams::default(),
+            vban: Some(cfg.clone()),
+        };
+        self.app.strips.push(strip.clone());
+        self.load_strip_module(&strip);
+        self.links.set_route(&strip.vban_node(), &strip.node_base(), true);
+        for (bus_id, on) in &strip.routes {
+            if let (true, Some(b)) = (*on, self.app.buses.iter().find(|b| b.id == *bus_id)) {
+                self.links.set_route(&strip.out_node(), &b.in_node(), true);
+            }
+        }
+        let tap = self.make_strip_tap(&strip);
+        self.strip_taps.push(tap);
+        self.reload_vban_port(cfg.port);
+        self.reconcile();
+        self.send_state();
+    }
+
+    fn set_strip_vban(&mut self, id: StripId, label: String, cfg: VbanRecv) {
+        let cfg = match cfg.validated() {
+            Ok(c) => c,
+            Err(e) => return self.report(format!("VBAN input: {e}")),
+        };
+        if let Some(e) = self.vban_conflict(Some(id), &cfg) {
+            return self.report(format!("VBAN input: {e}"));
+        }
+        let Some(s) = self.app.strips.iter_mut().find(|s| s.id == id && s.kind == StripKind::Vban) else {
+            return;
+        };
+        let old_port = s.vban.as_ref().map(|v| v.port);
+        let label = label.trim();
+        let relabel = !label.is_empty() && label != s.label;
+        if relabel {
+            s.label = label.to_string();
+        }
+        s.vban = Some(cfg.clone());
+        if relabel {
+            self.reload_strip(id); // the label is baked into node descriptions
+        }
+        if let Some(p) = old_port.filter(|p| *p != cfg.port) {
+            self.reload_vban_port(p);
+        }
+        self.reload_vban_port(cfg.port);
+        self.reconcile();
+        self.send_state();
+    }
+
+    fn remove_strip(&mut self, id: StripId) {
+        let Some(idx) = self.app.strips.iter().position(|s| s.id == id) else { return };
+        if self.app.strips[idx].kind != StripKind::Vban {
+            return self.report("only VBAN strips can be removed");
+        }
+        let s = self.app.strips.remove(idx);
+        let tap = self.strip_taps.remove(idx);
+        if let Some(tap) = &tap {
+            self.links.set_route(&s.out_node(), &tap.node_name, false);
+        }
+        for b in &self.app.buses {
+            self.links.set_route(&s.out_node(), &b.in_node(), false);
+        }
+        self.links.set_route(&s.vban_node(), &s.node_base(), false);
+        self.reconcile();
+        drop(tap);
+        self.nodes.remove(&s.control_node());
+        self.wanted_controls.remove(&s.control_node());
+        self.strip_modules.remove(&id);
+        if let Some(v) = &s.vban {
+            self.reload_vban_port(v.port);
+        }
+        if s.solo {
+            self.apply_strip_mutes();
+        }
+        self.send_state();
     }
 
     fn first_node(&self, class: &str) -> Option<String> {
@@ -544,6 +790,25 @@ impl Engine {
                 self.reload_bus(bus);
                 self.send_state();
             }
+            EngineCommand::SetBusVban { bus, config } => {
+                // A disabled config is stored as typed (half-filled forms are
+                // fine); only a config that is about to send must be valid.
+                let config = if config.enabled {
+                    match config.validated() {
+                        Ok(c) => c,
+                        Err(e) => return self.report(format!("VBAN output: {e}")),
+                    }
+                } else {
+                    VbanSend { enabled: false, ..config }
+                };
+                let Some(b) = self.app.buses.iter_mut().find(|b| b.id == bus) else { return };
+                b.vban = config;
+                self.apply_bus_vban(bus);
+                self.send_state();
+            }
+            EngineCommand::AddVbanStrip { label, config } => self.add_vban_strip(label, config),
+            EngineCommand::SetStripVban { strip, label, config } => self.set_strip_vban(strip, label, config),
+            EngineCommand::RemoveStrip { strip } => self.remove_strip(strip),
             EngineCommand::SetDefaultOutput { on } => {
                 self.apply_default_output(on);
                 self.send_state();
@@ -606,7 +871,11 @@ impl Engine {
         self.seq = self.seq.wrapping_add(1);
         lm_protocol::MeterFrame {
             seq: self.seq,
-            strips: self.strip_taps.iter().map(|t| t.accum.drain()).collect(),
+            strips: self
+                .strip_taps
+                .iter()
+                .map(|t| t.as_ref().map_or([-90.0; 4], |t| t.accum.drain()))
+                .collect(),
             buses: self.bus_taps.iter().map(|t| t.accum.drain()).collect(),
         }
     }
@@ -625,7 +894,26 @@ fn bus(id: BusId, label: &str, target: Option<String>) -> BusState {
         gain_db: 0.0,
         mute: false,
         limiter: LimiterParams::default(),
+        vban: VbanSend { stream_name: format!("linuxmeeter-{id:?}"), ..VbanSend::default() },
     }
+}
+
+/// The node whose presence decides whether a strip is `online`: its capture
+/// device for hardware strips, its receiver stream for VBAN strips.
+fn presence_node(s: &StripState) -> Option<String> {
+    match s.kind {
+        StripKind::Hardware => s.hw_key.clone(),
+        StripKind::Vban => Some(s.vban_node()),
+        StripKind::Virtual => None,
+    }
+}
+
+/// Version of the libpipewire we are linked against at runtime.
+fn pipewire_library_version() -> String {
+    // SAFETY: returns a pointer to a static NUL-terminated string.
+    unsafe { std::ffi::CStr::from_ptr(pipewire::sys::pw_get_library_version()) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn run(
@@ -638,6 +926,13 @@ fn run(
     let core = context.connect_rc(None)?;
     let registry = core.get_registry_rc()?;
 
+    let pw_version = pipewire_library_version();
+    let vban_rules = vban_recv_has_rules(&pw_version);
+    tracing::info!(
+        "libpipewire {pw_version}; VBAN receive {}",
+        if vban_rules { "filters by stream name" } else { "takes one stream per port (PipeWire < 1.4)" }
+    );
+
     let engine = Rc::new(RefCell::new(Engine {
         context: context.clone(),
         core: core.clone(),
@@ -647,6 +942,9 @@ fn run(
         links: LinkManager::default(),
         strip_modules: HashMap::new(),
         bus_modules: HashMap::new(),
+        vban_send_modules: HashMap::new(),
+        vban_recv_modules: HashMap::new(),
+        vban_rules,
         strip_taps: Vec::new(),
         bus_taps: Vec::new(),
         nodes: HashMap::new(),
@@ -684,10 +982,11 @@ fn run(
                                 }
                             }
                         }
-                        // Hardware strip target reappeared -> back online.
+                        // Hardware strip target reappeared, or a VBAN
+                        // stream started arriving -> online.
                         let mut changed = false;
                         for s in &mut e.app.strips {
-                            if s.hw_key.as_deref() == Some(name.as_str()) && !s.online {
+                            if presence_node(s).as_deref() == Some(name.as_str()) && !s.online {
                                 s.online = true;
                                 changed = true;
                             }
@@ -758,7 +1057,7 @@ fn run(
                     e.nodes.remove(&name);
                     let mut changed = false;
                     for s in &mut e.app.strips {
-                        if s.hw_key.as_deref() == Some(name.as_str()) {
+                        if presence_node(s).as_deref() == Some(name.as_str()) {
                             s.online = false;
                             changed = true;
                         }

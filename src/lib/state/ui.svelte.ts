@@ -5,6 +5,8 @@ class UiStore {
   eqStrip = $state<number | null>(null);
   /** Strip id whose Dynamics (gate/comp) panel is open, or null. */
   dynStrip = $state<number | null>(null);
+  /** VBAN network streams panel. */
+  vbanOpen = $state(false);
 }
 
 export const ui = new UiStore();

@@ -4,7 +4,8 @@
  * meters actually respond when you pull a fader or punch a route button —
  * design iteration feels like the real app.
  */
-import type { AppState, BusId, MeterFrame, StripState } from "./types";
+import type { AppState, BusId, MeterFrame, StripState, VbanRecv, VbanSend } from "./types";
+import { VBAN_DEFAULT_PORT, VBAN_STREAM_NAME_MAX } from "./types";
 import type { Ipc, Target } from "./ipc";
 import { powerSum } from "./utils/db";
 
@@ -55,6 +56,26 @@ const defaultEq = () => ({
 const defaultGate = () => ({ enabled: false, thresholdDb: -40, attackMs: 20, releaseMs: 100, holdMs: 50 });
 const defaultComp = () => ({ enabled: false, thresholdDb: -18, ratio: 4, attackMs: 20, releaseMs: 100, makeupDb: 0 });
 const defaultLimiter = () => ({ enabled: true, thresholdDb: -1, releaseMs: 50 });
+const defaultVbanSend = (bus: BusId): VbanSend => ({
+  enabled: false,
+  streamName: `linuxmeeter-${bus}`,
+  host: "127.0.0.1",
+  port: VBAN_DEFAULT_PORT,
+  rate: 48000,
+});
+
+/** Mirrors lm_protocol::vban_stream_name. */
+function vbanStreamName(raw: string): string {
+  const cleaned = Array.from(raw.trim().replace(/^~+/, ""))
+    .filter((c) => c >= " " && c <= "~")
+    .slice(0, VBAN_STREAM_NAME_MAX)
+    .join("")
+    .trim();
+  return cleaned || "Stream1";
+}
+
+const IPV4 = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
+const looksLikeIp = (s: string) => IPV4.test(s) || (s.includes(":") && /^[0-9a-fA-F:.]+$/.test(s));
 
 const routes = (on: BusId[]): Record<BusId, boolean> => ({
   A1: on.includes("A1"),
@@ -67,17 +88,17 @@ const state: AppState = {
   profileName: "Default",
   takeDefaultOutput: false,
   strips: [
-    { id: 1, kind: "hardware", label: "Mic", hwKey: "alsa_input.usb-ZOOM_Corporation_UAC-2", online: true, gainDb: -4, mute: false, solo: false, routes: routes(["A2", "B1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq() },
-    { id: 2, kind: "hardware", label: "Line In", hwKey: "alsa_input.pci-0000_31_00.4.analog-stereo", online: true, gainDb: -12, mute: false, solo: false, routes: routes(["A1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq() },
-    { id: 3, kind: "virtual", label: "System", hwKey: null, online: true, gainDb: 0, mute: false, solo: false, routes: routes(["A1", "A2"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq() },
-    { id: 4, kind: "virtual", label: "Music", hwKey: null, online: true, gainDb: -3.2, mute: false, solo: false, routes: routes(["A1", "A2", "B1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq() },
-    { id: 5, kind: "virtual", label: "Chat", hwKey: null, online: true, gainDb: -6, mute: false, solo: false, routes: routes(["A2", "B1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq() },
+    { id: 1, kind: "hardware", label: "Mic", hwKey: "alsa_input.usb-ZOOM_Corporation_UAC-2", online: true, gainDb: -4, mute: false, solo: false, routes: routes(["A2", "B1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), vban: null },
+    { id: 2, kind: "hardware", label: "Line In", hwKey: "alsa_input.pci-0000_31_00.4.analog-stereo", online: true, gainDb: -12, mute: false, solo: false, routes: routes(["A1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), vban: null },
+    { id: 3, kind: "virtual", label: "System", hwKey: null, online: true, gainDb: 0, mute: false, solo: false, routes: routes(["A1", "A2"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), vban: null },
+    { id: 4, kind: "virtual", label: "Music", hwKey: null, online: true, gainDb: -3.2, mute: false, solo: false, routes: routes(["A1", "A2", "B1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), vban: null },
+    { id: 5, kind: "virtual", label: "Chat", hwKey: null, online: true, gainDb: -6, mute: false, solo: false, routes: routes(["A2", "B1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), vban: null },
   ],
   buses: [
-    { id: "A1", label: "Speakers", targetHwKey: "alsa_output.pci-0000_2f_00.1.hdmi-stereo", online: true, gainDb: 0, mute: false, limiter: defaultLimiter() },
-    { id: "A2", label: "Headphones", targetHwKey: "alsa_output.usb-ZOOM_Corporation_UAC-2", online: true, gainDb: -2.5, mute: false, limiter: defaultLimiter() },
-    { id: "B1", label: "Stream Mic", targetHwKey: null, online: true, gainDb: 0, mute: false, limiter: defaultLimiter() },
-    { id: "B2", label: "Aux", targetHwKey: null, online: true, gainDb: -6, mute: false, limiter: defaultLimiter() },
+    { id: "A1", label: "Speakers", targetHwKey: "alsa_output.pci-0000_2f_00.1.hdmi-stereo", online: true, gainDb: 0, mute: false, limiter: defaultLimiter(), vban: defaultVbanSend("A1") },
+    { id: "A2", label: "Headphones", targetHwKey: "alsa_output.usb-ZOOM_Corporation_UAC-2", online: true, gainDb: -2.5, mute: false, limiter: defaultLimiter(), vban: defaultVbanSend("A2") },
+    { id: "B1", label: "Stream Mic", targetHwKey: null, online: true, gainDb: 0, mute: false, limiter: defaultLimiter(), vban: defaultVbanSend("B1") },
+    { id: "B2", label: "Aux", targetHwKey: null, online: true, gainDb: -6, mute: false, limiter: defaultLimiter(), vban: defaultVbanSend("B2") },
   ],
   devices: [
     { nodeName: "alsa_input.usb-ZOOM_Corporation_UAC-2", description: "ZOOM UAC-2", mediaClass: "Audio/Source", serial: 67, channels: 2 },
@@ -104,6 +125,41 @@ let mockAutostart = false;
 
 const meterSubs = new Set<(f: MeterFrame) => void>();
 const stateSubs = new Set<(s: AppState) => void>();
+const errorSubs = new Set<(m: string) => void>();
+
+/** Push a snapshot, as the engine does after structural changes. */
+function broadcast(): void {
+  for (const cb of stateSubs) cb(structuredClone(state));
+}
+
+/** Reject like the engine: emit an error and resend the unchanged state. */
+function reject(message: string): Promise<void> {
+  for (const cb of errorSubs) cb(message);
+  broadcast();
+  return Promise.resolve();
+}
+
+function checkRecv(config: VbanRecv, except: number | null): string | VbanRecv {
+  const senderIp = config.senderIp.trim();
+  if (senderIp && !looksLikeIp(senderIp)) return `VBAN input: "${senderIp}" is not an IP address`;
+  if (!(config.port >= 1 && config.port <= 65535)) return "VBAN input: port must be 1-65535";
+  const cfg: VbanRecv = {
+    streamName: vbanStreamName(config.streamName),
+    port: config.port,
+    senderIp,
+    latencyMs: Math.min(2000, Math.max(10, config.latencyMs)),
+  };
+  const clash = state.strips.find(
+    (s) =>
+      s.id !== except &&
+      s.vban &&
+      s.vban.port === cfg.port &&
+      s.vban.streamName === cfg.streamName &&
+      (!s.vban.senderIp || !cfg.senderIp || s.vban.senderIp === cfg.senderIp),
+  );
+  if (clash) return `VBAN input: strip "${clash.label}" already receives "${cfg.streamName}" on port ${cfg.port}`;
+  return cfg;
+}
 let seq = 0;
 let timer: ReturnType<typeof setInterval> | undefined;
 let lastTick = 0;
@@ -194,6 +250,71 @@ export const mockIpc: Ipc = {
     if (b) b.targetHwKey = hwKey;
     return Promise.resolve();
   },
+  setBusVban: (bus, config) => {
+    const b = state.buses.find((x) => x.id === bus);
+    if (!b) return Promise.resolve();
+    if (config.enabled) {
+      const host = config.host.trim();
+      if (!looksLikeIp(host)) return reject(`VBAN output: "${host}" is not an IP address`);
+      if (!(config.port >= 1 && config.port <= 65535)) return reject("VBAN output: port must be 1-65535");
+      b.vban = { ...config, host, streamName: vbanStreamName(config.streamName) };
+    } else {
+      b.vban = { ...config, enabled: false };
+    }
+    broadcast();
+    return Promise.resolve();
+  },
+  addVbanStrip: (label, config) => {
+    const cfg = checkRecv(config, null);
+    if (typeof cfg === "string") return reject(cfg);
+    const id = Math.max(0, ...state.strips.map((s) => s.id)) + 1;
+    state.strips.push({
+      id,
+      kind: "vban",
+      label: label.trim() || cfg.streamName,
+      hwKey: null,
+      // Pretend a sender shows up shortly after, like a real network peer.
+      online: false,
+      gainDb: 0,
+      mute: false,
+      solo: false,
+      routes: routes(["A1"]),
+      gate: defaultGate(),
+      comp: defaultComp(),
+      eq: defaultEq(),
+      vban: cfg,
+    });
+    sims.set(id, makeSim("music", -16, 5, Math.random() * 6));
+    broadcast();
+    setTimeout(() => {
+      const s = findStrip(id);
+      if (s) {
+        s.online = true;
+        broadcast();
+      }
+    }, 1200);
+    return Promise.resolve();
+  },
+  setStripVban: (stripId, label, config) => {
+    const s = findStrip(stripId);
+    if (!s || s.kind !== "vban") return Promise.resolve();
+    const cfg = checkRecv(config, stripId);
+    if (typeof cfg === "string") return reject(cfg);
+    if (label.trim()) s.label = label.trim();
+    s.vban = cfg;
+    broadcast();
+    return Promise.resolve();
+  },
+  removeStrip: (stripId) => {
+    const idx = state.strips.findIndex((s) => s.id === stripId);
+    const s = state.strips[idx];
+    if (!s) return Promise.resolve();
+    if (s.kind !== "vban") return reject("only VBAN strips can be removed");
+    state.strips.splice(idx, 1);
+    sims.delete(stripId);
+    broadcast();
+    return Promise.resolve();
+  },
   setDefaultOutput: (on) => {
     state.takeDefaultOutput = on;
     return Promise.resolve();
@@ -211,5 +332,9 @@ export const mockIpc: Ipc = {
   onStateChanged: (cb) => {
     stateSubs.add(cb);
     return () => stateSubs.delete(cb);
+  },
+  onError: (cb) => {
+    errorSubs.add(cb);
+    return () => errorSubs.delete(cb);
   },
 };

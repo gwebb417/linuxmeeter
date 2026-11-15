@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { ipc } from "../lib/ipc";
   import { mixer } from "../lib/state/mixer.svelte";
+  import { ui } from "../lib/state/ui.svelte";
   import { startDragging } from "../lib/window";
   import WindowControls from "./WindowControls.svelte";
 
@@ -9,6 +10,8 @@
   onMount(async () => {
     autostart = await ipc.getAutostart();
   });
+  let vbanActive = $derived(mixer.buses.some((b) => b.vban.enabled) || mixer.strips.some((s) => s.kind === "vban"));
+
   function toggleAutostart() {
     autostart = !autostart;
     void ipc.setAutostart(autostart);
@@ -51,6 +54,14 @@
       onclick={toggleAutostart}
     >
       AUTOSTART
+    </button>
+    <button
+      class="toggle"
+      class:active={vbanActive}
+      title="VBAN network audio: send buses to, and receive streams from, VoiceMeeter and other VBAN devices"
+      onclick={() => (ui.vbanOpen = true)}
+    >
+      VBAN
     </button>
   </div>
   <button class="iconbtn" title="Settings">

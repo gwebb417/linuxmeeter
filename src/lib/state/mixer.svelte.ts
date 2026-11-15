@@ -4,7 +4,19 @@
  * backend. Continuous controls (fader drags) throttle IPC to one call per
  * animation frame, with a guaranteed final send.
  */
-import type { AppState, BusId, BusState, CompParams, DeviceInfo, EqParams, GateParams, LimiterParams, StripState } from "../types";
+import type {
+  AppState,
+  BusId,
+  BusState,
+  CompParams,
+  DeviceInfo,
+  EqParams,
+  GateParams,
+  LimiterParams,
+  StripState,
+  VbanRecv,
+  VbanSend,
+} from "../types";
 import { ipc, type Target } from "../ipc";
 import { ingestFrame } from "./meters";
 
@@ -16,6 +28,9 @@ class MixerStore {
   takeDefaultOutput = $state(false);
   ready = $state(false);
   error = $state<string | null>(null);
+  /** Last rejected command from the engine (shown briefly, then cleared). */
+  notice = $state<string | null>(null);
+  #noticeTimer: ReturnType<typeof setTimeout> | undefined;
 
   anySolo = $derived(this.strips.some((s) => s.solo));
 
@@ -46,6 +61,13 @@ class MixerStore {
       ),
     );
     ipc.onStateChanged((state) => this.#apply(state, true));
+    ipc.onError((message) => this.showNotice(message));
+  }
+
+  showNotice(message: string): void {
+    this.notice = message;
+    clearTimeout(this.#noticeTimer);
+    this.#noticeTimer = setTimeout(() => (this.notice = null), 6000);
   }
 
   #apply(s: AppState, guardDragging = false): void {
@@ -161,6 +183,33 @@ class MixerStore {
     const b = this.bus(bus);
     if (b) b.targetHwKey = hwKey;
     void ipc.setBusTarget(bus, hwKey);
+  }
+
+  /** Optimistic; an invalid config is rejected by the engine, which resends state. */
+  setBusVban(bus: BusId, config: VbanSend): void {
+    const b = this.bus(bus);
+    if (b) b.vban = config;
+    void ipc.setBusVban(bus, config);
+  }
+
+  /** Not optimistic: the engine assigns the id, and the strip arrives with the next state. */
+  addVbanStrip(label: string, config: VbanRecv): void {
+    void ipc.addVbanStrip(label, config);
+  }
+
+  setStripVban(stripId: number, label: string, config: VbanRecv): void {
+    const s = this.strip(stripId);
+    if (s) {
+      if (label.trim()) s.label = label.trim();
+      s.vban = config;
+    }
+    void ipc.setStripVban(stripId, label, config);
+  }
+
+  /** Not optimistic either: meter frames are index-aligned with the engine's
+   *  strip list, so the local list only changes when the engine's does. */
+  removeStrip(stripId: number): void {
+    void ipc.removeStrip(stripId);
   }
 
   setDefaultOutput(on: boolean): void {

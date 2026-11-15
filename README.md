@@ -25,6 +25,11 @@ OBS, or any recorder can use.
   microphones** (post-limiter) selectable in any app
 - **Routing matrix** — A1/A2/B1/B2 toggles per strip, applied as live
   PipeWire links; mute/solo; peak/RMS metering with clip latch at 30 fps
+- **VBAN network audio** — send any bus's post-limiter mix to
+  VoiceMeeter (or any VBAN receiver) on another machine, and receive
+  VBAN streams as their own input strips with full DSP and routing. Built
+  on PipeWire's native `vban-send` / `vban-recv` modules; configure it from
+  the **VBAN** button in the top bar
 - **Default-output takeover** — one click makes the System strip your
   default sink so *all* desktop audio flows through the mixer
 - **Profiles** — everything persists to `~/.config/linuxmeeter/` (TOML,

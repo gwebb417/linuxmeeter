@@ -6,6 +6,7 @@
 
   let hardware = $derived(mixer.strips.filter((s) => s.kind === "hardware"));
   let virtual = $derived(mixer.strips.filter((s) => s.kind === "virtual"));
+  let network = $derived(mixer.strips.filter((s) => s.kind === "vban"));
 
   const WINDOW_H = 800;
   let rack: HTMLElement;
@@ -43,6 +44,17 @@
       {/each}
     </div>
   </section>
+
+  {#if network.length > 0}
+    <section class="group">
+      <div class="grouplabel">Network</div>
+      <div class="striprow">
+        {#each network as strip (strip.id)}
+          <InputStrip {strip} />
+        {/each}
+      </div>
+    </section>
+  {/if}
 
   <section class="group busgroup">
     <div class="grouplabel">Buses</div>

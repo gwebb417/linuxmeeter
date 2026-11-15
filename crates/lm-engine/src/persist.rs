@@ -79,6 +79,11 @@ fn sanitize(p: &mut Profile) {
         s.solo = false;
         // `online` is recomputed against the live registry at build time.
         s.online = s.kind == StripKind::Virtual;
+        // A hand-edited VBAN strip with no receiver config gets the defaults
+        // rather than silently receiving nothing.
+        if s.kind == StripKind::Vban && s.vban.is_none() {
+            s.vban = Some(Default::default());
+        }
         // Migrate pre-color-pad profiles (4 bands) to 8 bands.
         while s.eq.bands.len() < 8 {
             let i = s.eq.bands.len() - 4;
@@ -123,6 +128,7 @@ mod tests {
             gate: GateParams::default(),
             comp: Default::default(),
             eq: EqParams::default(),
+            vban: (kind == StripKind::Vban).then(Default::default),
         }
     }
 
@@ -138,6 +144,7 @@ mod tests {
                 gain_db: 0.0,
                 mute: false,
                 limiter: LimiterParams::default(),
+                vban: Default::default(),
             }],
         }
     }
@@ -277,6 +284,44 @@ releaseMs = 50.0
         assert_eq!(back.strips[0].gain_db, -6.0);
         sanitize(&mut back);
         assert_eq!(back.strips[0].eq.bands.len(), 8, "defaults then migration give a full band set");
+        assert!(!back.buses[0].vban.enabled, "an old profile must not start sending VBAN");
+        assert_eq!(back.strips[0].vban, None);
+    }
+
+    #[test]
+    fn vban_config_survives_a_toml_round_trip() {
+        let mut p = profile(vec![strip(1, StripKind::Virtual), strip(2, StripKind::Vban)]);
+        p.strips[1].vban = Some(lm_protocol::VbanRecv {
+            stream_name: "Game".into(),
+            port: 6981,
+            sender_ip: "192.168.1.7".into(),
+            latency_ms: 60,
+        });
+        p.buses[0].vban = lm_protocol::VbanSend {
+            enabled: true,
+            stream_name: "Mix".into(),
+            host: "192.168.1.255".into(),
+            port: 6980,
+            rate: 48000,
+        };
+
+        let text = toml::to_string_pretty(&p).expect("serialize");
+        let back: Profile = toml::from_str(&text).expect("deserialize");
+
+        assert_eq!(back.strips[1].kind, StripKind::Vban);
+        assert_eq!(back.strips[1].vban, p.strips[1].vban);
+        assert_eq!(back.strips[0].vban, None);
+        assert_eq!(back.buses[0].vban, p.buses[0].vban);
+    }
+
+    /// VBAN strips are online only while their receiver stream exists.
+    #[test]
+    fn sanitize_starts_vban_strips_offline_with_a_config() {
+        let mut p = profile(vec![strip(1, StripKind::Vban)]);
+        p.strips[0].vban = None; // hand-edited away
+        sanitize(&mut p);
+        assert!(!p.strips[0].online);
+        assert_eq!(p.strips[0].vban, Some(Default::default()));
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use lm_protocol::{
     AppState, BusId, CompParams, EngineCommand, EngineEvent, EqParams, GateParams, LimiterParams,
-    StripId, Target,
+    StripId, Target, VbanRecv, VbanSend,
 };
 use tauri::{Emitter, Manager};
 
@@ -78,6 +78,31 @@ fn set_strip_device(data: tauri::State<AppData>, strip_id: StripId, hw_key: Stri
 #[tauri::command]
 fn set_bus_target(data: tauri::State<AppData>, bus: BusId, hw_key: String) -> Result<(), String> {
     send(&data, EngineCommand::SetBusTarget { bus, hw_key })
+}
+
+#[tauri::command]
+fn set_bus_vban(data: tauri::State<AppData>, bus: BusId, config: VbanSend) -> Result<(), String> {
+    send(&data, EngineCommand::SetBusVban { bus, config })
+}
+
+#[tauri::command]
+fn add_vban_strip(data: tauri::State<AppData>, label: String, config: VbanRecv) -> Result<(), String> {
+    send(&data, EngineCommand::AddVbanStrip { label, config })
+}
+
+#[tauri::command]
+fn set_strip_vban(
+    data: tauri::State<AppData>,
+    strip_id: StripId,
+    label: String,
+    config: VbanRecv,
+) -> Result<(), String> {
+    send(&data, EngineCommand::SetStripVban { strip: strip_id, label, config })
+}
+
+#[tauri::command]
+fn remove_strip(data: tauri::State<AppData>, strip_id: StripId) -> Result<(), String> {
+    send(&data, EngineCommand::RemoveStrip { strip: strip_id })
 }
 
 #[tauri::command]
@@ -155,6 +180,10 @@ fn main() {
             set_limiter_params,
             set_strip_device,
             set_bus_target,
+            set_bus_vban,
+            add_vban_strip,
+            set_strip_vban,
+            remove_strip,
             set_default_output,
             get_autostart,
             set_autostart,
@@ -174,6 +203,9 @@ fn main() {
                             }
                             EngineEvent::Meters(f) => {
                                 let _ = handle.emit("meters", &f);
+                            }
+                            EngineEvent::Error(msg) => {
+                                let _ = handle.emit("engine_error", &msg);
                             }
                         }
                     }

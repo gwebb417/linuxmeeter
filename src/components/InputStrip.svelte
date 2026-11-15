@@ -25,7 +25,9 @@
   let deviceDisplay = $derived(
     strip.kind === "hardware"
       ? (mixer.devices.find((d) => d.nodeName === strip.hwKey)?.description ?? strip.hwKey ?? "—")
-      : `lm.strip.${strip.id}`,
+      : strip.kind === "vban" && strip.vban
+        ? `${strip.vban.streamName} :${strip.vban.port}`
+        : `lm.strip.${strip.id}`,
   );
 </script>
 
@@ -35,7 +37,7 @@
     deviceValue={strip.hwKey}
     {deviceDisplay}
     {deviceOptions}
-    deviceDisabled={strip.kind === "virtual"}
+    deviceDisabled={strip.kind !== "hardware"}
     ondevicechange={(v) => mixer.setStripDevice(strip.id, v)}
   />
 

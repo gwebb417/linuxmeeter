@@ -452,7 +452,7 @@ releaseMs = 50.0
         let back: Profile = toml::from_str(&toml::to_string_pretty(&p).unwrap()).unwrap();
         assert_eq!(back.buses.iter().map(|b| b.id).collect::<Vec<_>>(), [BusId::A1, BusId::A5, BusId::B3]);
         assert_eq!(back.buses[2].label, "Discord");
-        assert_eq!(back.strips[0].routes[&BusId::B3], true);
+        assert!(back.strips[0].routes[&BusId::B3]);
     }
 
     #[test]

@@ -2032,7 +2032,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "linuxmeeter"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "lm-engine",
  "lm-protocol",
@@ -2054,7 +2054,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "lm-engine"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "libspa",
  "lm-protocol",
@@ -2069,7 +2069,7 @@ dependencies = [
 
 [[package]]
 name = "lm-protocol"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",

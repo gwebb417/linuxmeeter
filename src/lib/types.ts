@@ -74,6 +74,18 @@ export interface EqParams {
   bands: EqBand[];
 }
 
+/** A strip's stereo image, applied after the EQ (mirrors lm_protocol::PanParams). */
+export interface PanParams {
+  /** Sum to mono (wins over reverse). */
+  mono: boolean;
+  /** Swap left and right. */
+  reverse: boolean;
+  /** -1 hard left … 0 centre … 1 hard right; only ever attenuates. */
+  balance: number;
+}
+
+export const defaultPan = (): PanParams => ({ mono: false, reverse: false, balance: 0 });
+
 export interface StripState {
   id: number;
   kind: StripKind;
@@ -89,6 +101,7 @@ export interface StripState {
   gate: GateParams;
   comp: CompParams;
   eq: EqParams;
+  pan: PanParams;
   /** Receiver config; non-null exactly for "vban" strips. */
   vban: VbanRecv | null;
 }

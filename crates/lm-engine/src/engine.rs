@@ -198,6 +198,7 @@ impl Engine {
                 gate: GateParams::default(),
                 comp: CompParams::default(),
                 eq: EqParams::default(),
+                pan: Default::default(),
                 vban: None,
             });
             next_id += 1;
@@ -216,6 +217,7 @@ impl Engine {
                 gate: GateParams::default(),
                 comp: CompParams::default(),
                 eq: EqParams::default(),
+                pan: Default::default(),
                 vban: None,
             });
             next_id += 1;
@@ -485,6 +487,7 @@ impl Engine {
             gate: GateParams::default(),
             comp: CompParams::default(),
             eq: EqParams::default(),
+            pan: Default::default(),
             vban: Some(cfg.clone()),
         };
         self.app.strips.push(strip.clone());
@@ -579,6 +582,7 @@ impl Engine {
             gate: GateParams::default(),
             comp: CompParams::default(),
             eq: EqParams::default(),
+            pan: Default::default(),
             vban: None,
         };
         self.app.strips.push(strip.clone());
@@ -829,6 +833,18 @@ impl Engine {
         self.set_props(&strip.control_node(), &params::filter_params(&borrowed));
     }
 
+    /// Mono / reverse / balance, as the two stereo-image mixers' gains.
+    fn apply_pan(&self, strip: &StripState) {
+        let m = strip.pan.matrix();
+        let pairs: Vec<(&str, f32)> = vec![
+            ("panl:Gain 1", m[0][0]),
+            ("panl:Gain 2", m[0][1]),
+            ("panr:Gain 1", m[1][0]),
+            ("panr:Gain 2", m[1][1]),
+        ];
+        self.set_props(&strip.control_node(), &params::filter_params(&pairs));
+    }
+
     /// Push the full parameter set for whichever strip/bus owns `node_name`.
     fn apply_all_for(&self, node_name: &str) {
         if let Some(s) = self.app.strips.iter().find(|s| s.control_node() == node_name) {
@@ -836,6 +852,7 @@ impl Engine {
             self.apply_gate(s);
             self.apply_comp(s);
             self.apply_eq(s);
+            self.apply_pan(s);
             self.apply_strip_mutes();
         }
         if let Some(b) = self.app.buses.iter().find(|b| b.in_node() == node_name) {
@@ -935,6 +952,15 @@ impl Engine {
                 }
                 if let Some(s) = self.app.strips.iter().find(|s| s.id == strip) {
                     self.apply_eq(s);
+                }
+                self.dirty = true;
+            }
+            EngineCommand::SetPanParams { strip, params } => {
+                if let Some(s) = self.app.strips.iter_mut().find(|s| s.id == strip) {
+                    s.pan = params;
+                }
+                if let Some(s) = self.app.strips.iter().find(|s| s.id == strip) {
+                    self.apply_pan(s);
                 }
                 self.dirty = true;
             }

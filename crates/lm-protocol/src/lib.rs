@@ -157,6 +157,48 @@ impl Default for EqParams {
     }
 }
 
+/// A strip's stereo image, applied after the EQ: VoiceMeeter's mono and
+/// stereo-reverse buttons plus a balance control.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PanParams {
+    /// Sum both channels to mono (wins over `reverse`, which is moot then).
+    pub mono: bool,
+    /// Swap left and right.
+    pub reverse: bool,
+    /// -1 = hard left, 0 = centre, 1 = hard right. Attenuates the opposite
+    /// side only, so centre is unity and nothing is ever boosted.
+    pub balance: f32,
+}
+
+impl Default for PanParams {
+    fn default() -> Self {
+        Self { mono: false, reverse: false, balance: 0.0 }
+    }
+}
+
+impl PanParams {
+    /// The 2x2 gain matrix the strip applies: `[[L<-L, L<-R], [R<-L, R<-R]]`.
+    pub fn matrix(&self) -> [[f32; 2]; 2] {
+        let mut m = if self.mono {
+            [[0.5, 0.5], [0.5, 0.5]]
+        } else if self.reverse {
+            [[0.0, 1.0], [1.0, 0.0]]
+        } else {
+            [[1.0, 0.0], [0.0, 1.0]]
+        };
+        let b = if self.balance.is_finite() { self.balance.clamp(-1.0, 1.0) } else { 0.0 };
+        let (gl, gr) = ((1.0 - b).min(1.0), (1.0 + b).min(1.0));
+        for v in &mut m[0] {
+            *v *= gl;
+        }
+        for v in &mut m[1] {
+            *v *= gr;
+        }
+        m
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LimiterParams {
@@ -305,6 +347,9 @@ pub struct StripState {
     /// `default` so profiles written before the EQ existed still load.
     #[serde(default)]
     pub eq: EqParams,
+    /// `default` so profiles written before panning existed still load.
+    #[serde(default)]
+    pub pan: PanParams,
     /// Receiver config; Some exactly for [`StripKind::Vban`] strips.
     #[serde(default)]
     pub vban: Option<VbanRecv>,
@@ -425,6 +470,7 @@ pub enum EngineCommand {
     SetGateParams { strip: StripId, params: GateParams },
     SetCompParams { strip: StripId, params: CompParams },
     SetEqParams { strip: StripId, params: EqParams },
+    SetPanParams { strip: StripId, params: PanParams },
     SetLimiterParams { bus: BusId, params: LimiterParams },
     /// Point a hardware strip at a different capture device (module reload).
     SetStripDevice { strip: StripId, hw_key: String },
@@ -487,6 +533,7 @@ mod tests {
             gate: GateParams::default(),
             comp: CompParams::default(),
             eq: EqParams::default(),
+            pan: Default::default(),
             vban: (kind == StripKind::Vban).then(VbanRecv::default),
         }
     }
@@ -650,6 +697,7 @@ mod tests {
             EngineCommand::RemoveStrip { strip: 9 },
             EngineCommand::AddStrip { kind: StripKind::Hardware, label: "Guitar".into() },
             EngineCommand::AddBus { output: true },
+            EngineCommand::SetPanParams { strip: 2, params: PanParams { mono: true, ..Default::default() } },
             EngineCommand::RemoveBus { bus: BusId::A4 },
             EngineCommand::SetLabel { target: Target::Bus { bus: BusId::B3 }, label: "Discord".into() },
             EngineCommand::Shutdown,
@@ -725,6 +773,62 @@ mod tests {
         assert_eq!(clean_label(&"x".repeat(50)).map(|s| s.len()), Some(LABEL_MAX));
         assert_eq!(clean_label("   "), None);
         assert_eq!(clean_label("Café ♪").as_deref(), Some("Café ♪"), "labels may be any printable text");
+    }
+
+    // ---- stereo image ------------------------------------------------------
+
+    #[test]
+    fn default_pan_is_the_identity() {
+        assert_eq!(PanParams::default().matrix(), [[1.0, 0.0], [0.0, 1.0]]);
+    }
+
+    #[test]
+    fn mono_averages_both_channels_into_each_side() {
+        let m = PanParams { mono: true, ..Default::default() }.matrix();
+        assert_eq!(m, [[0.5, 0.5], [0.5, 0.5]]);
+        // Mono wins over reverse: swapping identical channels changes nothing.
+        assert_eq!(PanParams { mono: true, reverse: true, balance: 0.0 }.matrix(), m);
+    }
+
+    #[test]
+    fn reverse_swaps_left_and_right() {
+        assert_eq!(PanParams { reverse: true, ..Default::default() }.matrix(), [[0.0, 1.0], [1.0, 0.0]]);
+    }
+
+    /// Balance only ever turns the far side down: centre is unity and nothing
+    /// is boosted, so panning can't push a strip into clipping.
+    #[test]
+    fn balance_attenuates_the_opposite_side_only() {
+        let left = PanParams { balance: -1.0, ..Default::default() }.matrix();
+        assert_eq!(left, [[1.0, 0.0], [0.0, 0.0]], "hard left silences the right channel");
+        let half_right = PanParams { balance: 0.5, ..Default::default() }.matrix();
+        assert_eq!(half_right, [[0.5, 0.0], [0.0, 1.0]]);
+        let wild = PanParams { balance: 7.0, ..Default::default() }.matrix();
+        assert_eq!(wild, [[0.0, 0.0], [0.0, 1.0]], "out-of-range balance is clamped");
+        let nan = PanParams { balance: f32::NAN, ..Default::default() }.matrix();
+        assert_eq!(nan, [[1.0, 0.0], [0.0, 1.0]], "a NaN from a bad profile means centre");
+        for p in [left, half_right, wild] {
+            assert!(p.iter().flatten().all(|g| (0.0..=1.0).contains(g)));
+        }
+    }
+
+    #[test]
+    fn balance_combines_with_reverse() {
+        let m = PanParams { reverse: true, balance: -1.0, mono: false }.matrix();
+        assert_eq!(m, [[0.0, 1.0], [0.0, 0.0]], "reversed, then only the left output remains");
+    }
+
+    /// Profiles from before panning have no `pan` key, and a partial `pan`
+    /// table (hand-edited) fills in the rest.
+    #[test]
+    fn pan_is_optional_in_saved_state() {
+        let mut v = serde_json::to_value(strip(1, StripKind::Virtual)).unwrap();
+        v.as_object_mut().unwrap().remove("pan");
+        assert_eq!(serde_json::from_value::<StripState>(v.clone()).unwrap().pan, PanParams::default());
+        v["pan"] = serde_json::json!({ "mono": true });
+        let s: StripState = serde_json::from_value(v).unwrap();
+        assert!(s.pan.mono && !s.pan.reverse && s.pan.balance == 0.0);
+        assert!(serde_json::to_value(PanParams::default()).unwrap().get("balance").is_some());
     }
 
     /// Profiles from before the extra buses carry routes for four buses only.

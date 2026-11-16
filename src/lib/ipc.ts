@@ -11,6 +11,7 @@ import type {
   GateParams,
   LimiterParams,
   MeterFrame,
+  PanParams,
   VbanRecv,
   VbanSend,
 } from "./types";
@@ -27,6 +28,7 @@ export interface Ipc {
   setGateParams(stripId: number, params: GateParams): Promise<void>;
   setCompParams(stripId: number, params: CompParams): Promise<void>;
   setEqParams(stripId: number, params: EqParams): Promise<void>;
+  setPanParams(stripId: number, params: PanParams): Promise<void>;
   setLimiterParams(bus: BusId, params: LimiterParams): Promise<void>;
   setStripDevice(stripId: number, hwKey: string): Promise<void>;
   setBusTarget(bus: BusId, hwKey: string): Promise<void>;
@@ -71,6 +73,7 @@ function tauriIpc(): Ipc {
     setGateParams: (stripId, params) => invoke("set_gate_params", { stripId, params }),
     setCompParams: (stripId, params) => invoke("set_comp_params", { stripId, params }),
     setEqParams: (stripId, params) => invoke("set_eq_params", { stripId, params }),
+    setPanParams: (stripId, params) => invoke("set_pan_params", { stripId, params }),
     setLimiterParams: (bus, params) => invoke("set_limiter_params", { bus, params }),
     setStripDevice: (stripId, hwKey) => invoke("set_strip_device", { stripId, hwKey }),
     setBusTarget: (bus, hwKey) => invoke("set_bus_target", { bus, hwKey }),

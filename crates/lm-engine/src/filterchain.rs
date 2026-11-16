@@ -62,6 +62,38 @@ const LV2_COMP: &str = "http://lsp-plug.in/plugins/lv2/compressor_stereo";
 const LV2_EQ: &str = "http://lsp-plug.in/plugins/lv2/para_equalizer_x8_stereo";
 const LV2_LIMITER: &str = "http://lsp-plug.in/plugins/lv2/limiter_stereo";
 
+/// Every input strip's DSP: gate → comp → EQ → stereo image.
+///
+/// The stereo image (mono / reverse / balance) is a 2x2 gain matrix built from
+/// two builtin mixers: `panl` produces the left output from (L, R) and `panr`
+/// the right. Their `Gain 1` / `Gain 2` controls are the matrix rows from
+/// [`lm_protocol::PanParams::matrix`]; the defaults here are the identity, so
+/// a strip passes audio unchanged until the engine says otherwise.
+pub fn strip_graph() -> serde_json::Value {
+    json!({
+        "nodes": [
+            { "type": "lv2", "name": "gate", "plugin": LV2_GATE },
+            { "type": "lv2", "name": "comp", "plugin": LV2_COMP },
+            { "type": "lv2", "name": "eq",   "plugin": LV2_EQ },
+            { "type": "builtin", "name": "panl", "label": "mixer", "control": { "Gain 1": 1.0, "Gain 2": 0.0 } },
+            { "type": "builtin", "name": "panr", "label": "mixer", "control": { "Gain 1": 0.0, "Gain 2": 1.0 } },
+        ],
+        "links": [
+            { "output": "gate:out_l", "input": "comp:in_l" },
+            { "output": "gate:out_r", "input": "comp:in_r" },
+            { "output": "comp:out_l", "input": "eq:in_l" },
+            { "output": "comp:out_r", "input": "eq:in_r" },
+            // Each EQ output feeds both mixers (an output may fan out).
+            { "output": "eq:out_l", "input": "panl:In 1" },
+            { "output": "eq:out_r", "input": "panl:In 2" },
+            { "output": "eq:out_l", "input": "panr:In 1" },
+            { "output": "eq:out_r", "input": "panr:In 2" },
+        ],
+        "inputs":  [ "gate:in_l", "gate:in_r" ],
+        "outputs": [ "panl:Out", "panr:Out" ],
+    })
+}
+
 /// Module args for a virtual input strip: an `Audio/Sink` other apps play
 /// into, processed through gate → comp → EQ.
 ///
@@ -86,21 +118,7 @@ pub fn virtual_strip_args(sink_name: &str, label: &str, autoconnect_output: bool
     json!({
         "node.description": label,
         "media.name": label,
-        "filter.graph": {
-            "nodes": [
-                { "type": "lv2", "name": "gate", "plugin": LV2_GATE },
-                { "type": "lv2", "name": "comp", "plugin": LV2_COMP },
-                { "type": "lv2", "name": "eq",   "plugin": LV2_EQ },
-            ],
-            "links": [
-                { "output": "gate:out_l", "input": "comp:in_l" },
-                { "output": "gate:out_r", "input": "comp:in_r" },
-                { "output": "comp:out_l", "input": "eq:in_l" },
-                { "output": "comp:out_r", "input": "eq:in_r" },
-            ],
-            "inputs":  [ "gate:in_l", "gate:in_r" ],
-            "outputs": [ "eq:out_l", "eq:out_r" ],
-        },
+        "filter.graph": strip_graph(),
         "capture.props": {
             "node.name": sink_name,
             "node.description": label,
@@ -121,21 +139,7 @@ pub fn hardware_strip_args(strip_name: &str, label: &str, hw_target: &str) -> St
     json!({
         "node.description": label,
         "media.name": label,
-        "filter.graph": {
-            "nodes": [
-                { "type": "lv2", "name": "gate", "plugin": LV2_GATE },
-                { "type": "lv2", "name": "comp", "plugin": LV2_COMP },
-                { "type": "lv2", "name": "eq",   "plugin": LV2_EQ },
-            ],
-            "links": [
-                { "output": "gate:out_l", "input": "comp:in_l" },
-                { "output": "gate:out_r", "input": "comp:in_r" },
-                { "output": "comp:out_l", "input": "eq:in_l" },
-                { "output": "comp:out_r", "input": "eq:in_r" },
-            ],
-            "inputs":  [ "gate:in_l", "gate:in_r" ],
-            "outputs": [ "eq:out_l", "eq:out_r" ],
-        },
+        "filter.graph": strip_graph(),
         "capture.props": {
             "node.name": format!("{strip_name}.cap"),
             "node.description": format!("{label} (capture)"),
@@ -166,21 +170,7 @@ pub fn vban_strip_args(strip_name: &str, label: &str) -> String {
     json!({
         "node.description": label,
         "media.name": label,
-        "filter.graph": {
-            "nodes": [
-                { "type": "lv2", "name": "gate", "plugin": LV2_GATE },
-                { "type": "lv2", "name": "comp", "plugin": LV2_COMP },
-                { "type": "lv2", "name": "eq",   "plugin": LV2_EQ },
-            ],
-            "links": [
-                { "output": "gate:out_l", "input": "comp:in_l" },
-                { "output": "gate:out_r", "input": "comp:in_r" },
-                { "output": "comp:out_l", "input": "eq:in_l" },
-                { "output": "comp:out_r", "input": "eq:in_r" },
-            ],
-            "inputs":  [ "gate:in_l", "gate:in_r" ],
-            "outputs": [ "eq:out_l", "eq:out_r" ],
-        },
+        "filter.graph": strip_graph(),
         "capture.props": {
             "node.name": strip_name,
             "node.description": format!("{label} (VBAN in)"),
@@ -555,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn strip_dsp_chain_is_gate_then_comp_then_eq() {
+    fn strip_dsp_chain_is_gate_comp_eq_then_stereo_image() {
         let v = parse(&virtual_strip_args("lm.strip.1", "System", false));
         let names: Vec<&str> = v["filter.graph"]["nodes"]
             .as_array()
@@ -563,11 +553,37 @@ mod tests {
             .iter()
             .map(|n| n["name"].as_str().expect("node name"))
             .collect();
-        assert_eq!(names, ["gate", "comp", "eq"]);
+        assert_eq!(names, ["gate", "comp", "eq", "panl", "panr"]);
         // The Props keys the engine writes are "<node>:<port>"; these prefixes
         // are the contract between filterchain.rs and engine.rs.
         assert_eq!(v["filter.graph"]["inputs"][0], "gate:in_l");
-        assert_eq!(v["filter.graph"]["outputs"][0], "eq:out_l");
+        assert_eq!(v["filter.graph"]["outputs"], json!(["panl:Out", "panr:Out"]));
+    }
+
+    /// All three strip kinds share one graph, so a DSP stage can't go missing
+    /// from one of them.
+    #[test]
+    fn every_strip_kind_uses_the_same_graph() {
+        let g = strip_graph();
+        assert_eq!(parse(&virtual_strip_args("s", "S", false))["filter.graph"], g);
+        assert_eq!(parse(&hardware_strip_args("s", "S", "alsa_input.x"))["filter.graph"], g);
+        assert_eq!(parse(&vban_strip_args("s", "S"))["filter.graph"], g);
+    }
+
+    /// The stereo-image mixers start as the identity: a fresh strip is
+    /// unchanged until the engine pushes its pan settings.
+    #[test]
+    fn stereo_image_mixers_default_to_pass_through() {
+        let g = strip_graph();
+        let node = |n: &str| g["nodes"].as_array().unwrap().iter().find(|x| x["name"] == n).unwrap().clone();
+        assert_eq!(node("panl")["label"], "mixer");
+        assert_eq!(node("panl")["control"], json!({ "Gain 1": 1.0, "Gain 2": 0.0 }));
+        assert_eq!(node("panr")["control"], json!({ "Gain 1": 0.0, "Gain 2": 1.0 }));
+        // Both EQ outputs reach both mixers, in L, R order.
+        let links = g["links"].as_array().unwrap();
+        for (out, inp) in [("eq:out_l", "panl:In 1"), ("eq:out_r", "panl:In 2"), ("eq:out_l", "panr:In 1"), ("eq:out_r", "panr:In 2")] {
+            assert!(links.contains(&json!({ "output": out, "input": inp })), "missing {out} -> {inp}");
+        }
     }
 
     #[test]

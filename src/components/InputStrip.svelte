@@ -11,6 +11,7 @@
   import RoutingToggleGroup from "./RoutingToggleGroup.svelte";
   import MuteSoloButtons from "./MuteSoloButtons.svelte";
   import ColorPad from "./ColorPad.svelte";
+  import PanRow from "./PanRow.svelte";
 
   interface Props {
     strip: StripState;
@@ -100,6 +101,7 @@
   </div>
 
   <ColorPad {strip} />
+  <PanRow pan={strip.pan} onchange={(p) => mixer.setPanParams(strip.id, p)} />
 
   <div class="sep"></div>
   <RoutingToggleGroup

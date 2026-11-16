@@ -5,7 +5,7 @@
  * design iteration feels like the real app.
  */
 import type { AppState, BusId, MeterFrame, StripState, VbanRecv, VbanSend } from "./types";
-import { BUS_IDS, LABEL_MAX, MAX_STRIPS, VBAN_DEFAULT_PORT, VBAN_STREAM_NAME_MAX, isOutputBus } from "./types";
+import { BUS_IDS, LABEL_MAX, MAX_STRIPS, VBAN_DEFAULT_PORT, VBAN_STREAM_NAME_MAX, defaultPan, isOutputBus } from "./types";
 import type { Ipc, Target } from "./ipc";
 import { powerSum } from "./utils/db";
 
@@ -91,11 +91,11 @@ const state: AppState = {
   profileName: "Default",
   takeDefaultOutput: false,
   strips: [
-    { id: 1, kind: "hardware", label: "Mic", hwKey: "alsa_input.usb-ZOOM_Corporation_UAC-2", online: true, gainDb: -4, mute: false, solo: false, routes: routes(["A2", "B1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), vban: null },
-    { id: 2, kind: "hardware", label: "Line In", hwKey: "alsa_input.pci-0000_31_00.4.analog-stereo", online: true, gainDb: -12, mute: false, solo: false, routes: routes(["A1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), vban: null },
-    { id: 3, kind: "virtual", label: "System", hwKey: null, online: true, gainDb: 0, mute: false, solo: false, routes: routes(["A1", "A2"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), vban: null },
-    { id: 4, kind: "virtual", label: "Music", hwKey: null, online: true, gainDb: -3.2, mute: false, solo: false, routes: routes(["A1", "A2", "B1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), vban: null },
-    { id: 5, kind: "virtual", label: "Chat", hwKey: null, online: true, gainDb: -6, mute: false, solo: false, routes: routes(["A2", "B1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), vban: null },
+    { id: 1, kind: "hardware", label: "Mic", hwKey: "alsa_input.usb-ZOOM_Corporation_UAC-2", online: true, gainDb: -4, mute: false, solo: false, routes: routes(["A2", "B1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), pan: defaultPan(), vban: null },
+    { id: 2, kind: "hardware", label: "Line In", hwKey: "alsa_input.pci-0000_31_00.4.analog-stereo", online: true, gainDb: -12, mute: false, solo: false, routes: routes(["A1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), pan: defaultPan(), vban: null },
+    { id: 3, kind: "virtual", label: "System", hwKey: null, online: true, gainDb: 0, mute: false, solo: false, routes: routes(["A1", "A2"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), pan: defaultPan(), vban: null },
+    { id: 4, kind: "virtual", label: "Music", hwKey: null, online: true, gainDb: -3.2, mute: false, solo: false, routes: routes(["A1", "A2", "B1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), pan: defaultPan(), vban: null },
+    { id: 5, kind: "virtual", label: "Chat", hwKey: null, online: true, gainDb: -6, mute: false, solo: false, routes: routes(["A2", "B1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), pan: defaultPan(), vban: null },
   ],
   buses: [
     { id: "A1", label: "Speakers", targetHwKey: "alsa_output.pci-0000_2f_00.1.hdmi-stereo", online: true, gainDb: 0, mute: false, limiter: defaultLimiter(), vban: defaultVbanSend("A1") },
@@ -184,7 +184,11 @@ function startSim(): void {
       const lvl = audible && s.gainDb !== -Infinity ? raw + s.gainDb : -90;
       levels.set(s.id, lvl);
       const jitter = () => Math.random() * 1.2;
-      return [lvl + 0.6 + jitter(), lvl - 0.6 + jitter(), lvl - 2.5, lvl - 2.8];
+      // Balance only attenuates the far side (lm_protocol::PanParams::matrix).
+      const b = s.pan.balance;
+      const side = (g: number) => (g <= 0 ? -90 : 20 * Math.log10(g));
+      const [gl, gr] = [side(Math.min(1, 1 - b)), side(Math.min(1, 1 + b))];
+      return [lvl + 0.6 + jitter() + gl, lvl - 0.6 + jitter() + gr, lvl - 2.5 + gl, lvl - 2.8 + gr];
     });
     const busFrames: number[][] = state.buses.map((b) => {
       const inputs = state.strips.filter((s) => s.routes[b.id]).map((s) => levels.get(s.id)!);
@@ -238,6 +242,11 @@ export const mockIpc: Ipc = {
     if (s) s.eq = structuredClone(params);
     return Promise.resolve();
   },
+  setPanParams: (stripId, params) => {
+    const s = findStrip(stripId);
+    if (s) s.pan = { ...params, balance: Math.max(-1, Math.min(1, params.balance)) };
+    return Promise.resolve();
+  },
   setLimiterParams: (bus, params) => {
     const b = state.buses.find((x) => x.id === bus);
     if (b) b.limiter = { ...params };
@@ -284,7 +293,7 @@ export const mockIpc: Ipc = {
       routes: routes(["A1"]),
       gate: defaultGate(),
       comp: defaultComp(),
-      eq: defaultEq(),
+      eq: defaultEq(), pan: defaultPan(),
       vban: cfg,
     });
     sims.set(id, makeSim("music", -16, 5, Math.random() * 6));
@@ -334,7 +343,7 @@ export const mockIpc: Ipc = {
       routes: routes([]),
       gate: defaultGate(),
       comp: defaultComp(),
-      eq: defaultEq(),
+      eq: defaultEq(), pan: defaultPan(),
       vban: null,
     });
     sims.set(id, makeSim(kind === "hardware" ? "speech" : "music", -20, 6, Math.random() * 6));

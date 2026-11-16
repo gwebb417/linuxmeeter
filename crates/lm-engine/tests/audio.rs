@@ -357,6 +357,7 @@ fn strip(id: u32) -> StripState {
         gate: Default::default(),
         comp: Default::default(),
         eq: Default::default(),
+        pan: Default::default(),
         vban: None,
     };
     s.gain_db = 0.0;
@@ -546,6 +547,48 @@ fn strip_gain_moves_the_metered_level_by_the_requested_db() {
         (delta - 12.0).abs() < 1.5,
         "asked for -12 dB, meter moved {delta:.2} dB ({before:.2} -> {after:.2})"
     );
+}
+
+/// The stereo-image stage is real DSP: balance hard left must silence the right
+/// output channel and leave the left untouched, through the same Props keys
+/// the engine writes.
+#[test]
+#[ignore = "requires a PipeWire daemon; run with `make test-audio`"]
+fn balance_hard_left_silences_the_right_channel() {
+    let (rig, strip_meter, _bus_meter, s, _b) = full_chain(0.5);
+
+    let [l0, r0, ..] = rig.measure(&strip_meter, 500);
+    assert!(l0 > -20.0 && (l0 - r0).abs() < 1.0, "centred tone should read equal L/R ({l0:.1}/{r0:.1})");
+
+    let m = lm_protocol::PanParams { balance: -1.0, ..Default::default() }.matrix();
+    rig.set_props(
+        &s.control_node(),
+        &params::filter_params(&[
+            ("panl:Gain 1", m[0][0]),
+            ("panl:Gain 2", m[0][1]),
+            ("panr:Gain 1", m[1][0]),
+            ("panr:Gain 2", m[1][1]),
+        ]),
+    );
+    rig.settle(300);
+    let [l1, r1, ..] = rig.measure(&strip_meter, 500);
+    assert!((l1 - l0).abs() < 1.0, "left must be unchanged ({l0:.1} -> {l1:.1})");
+    assert!(r1 < -60.0, "right must be silent, got {r1:.1} dBFS");
+
+    // Mono of a centred tone is the same tone on both sides at the same level.
+    let m = lm_protocol::PanParams { mono: true, ..Default::default() }.matrix();
+    rig.set_props(
+        &s.control_node(),
+        &params::filter_params(&[
+            ("panl:Gain 1", m[0][0]),
+            ("panl:Gain 2", m[0][1]),
+            ("panr:Gain 1", m[1][0]),
+            ("panr:Gain 2", m[1][1]),
+        ]),
+    );
+    rig.settle(300);
+    let [l2, r2, ..] = rig.measure(&strip_meter, 500);
+    assert!((l2 - l0).abs() < 1.0 && (r2 - r0).abs() < 1.0, "mono of identical channels is unity ({l2:.1}/{r2:.1})");
 }
 
 /// Mute must actually silence the audio, not just grey out a button.

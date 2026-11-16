@@ -21,6 +21,8 @@ OBS, or any recorder can use.
 
   ![Dynamics panel](docs/screenshot-dyn.png)
 
+- **Stereo image per strip** — VoiceMeeter-style **MONO** and **⇄**
+  (swap left/right) buttons plus a balance slider, applied after the EQ
 - **Output buses** — up to five A buses (A1–A5) to hardware devices and
   three B buses (B1–B3) as **virtual microphones** (post-limiter) selectable
   in any app; add them with **+A** / **+B**

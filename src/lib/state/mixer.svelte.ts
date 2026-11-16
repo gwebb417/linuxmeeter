@@ -13,6 +13,7 @@ import type {
   EqParams,
   GateParams,
   LimiterParams,
+  PanParams,
   StripState,
   VbanRecv,
   VbanSend,
@@ -165,6 +166,12 @@ class MixerStore {
     const s = this.strip(stripId);
     if (s) s.eq = params;
     void ipc.setEqParams(stripId, params);
+  }
+
+  setPanParams(stripId: number, params: PanParams): void {
+    const s = this.strip(stripId);
+    if (s) s.pan = params;
+    void ipc.setPanParams(stripId, params);
   }
 
   setLimiterParams(bus: BusId, params: LimiterParams): void {

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use lm_protocol::{
     AppState, BusId, CompParams, EngineCommand, EngineEvent, EqParams, GateParams, LimiterParams,
-    StripId, StripKind, Target, VbanRecv, VbanSend,
+    PanParams, StripId, StripKind, Target, VbanRecv, VbanSend,
 };
 use tauri::{Emitter, Manager};
 
@@ -63,6 +63,11 @@ fn set_comp_params(data: tauri::State<AppData>, strip_id: StripId, params: CompP
 #[tauri::command]
 fn set_eq_params(data: tauri::State<AppData>, strip_id: StripId, params: EqParams) -> Result<(), String> {
     send(&data, EngineCommand::SetEqParams { strip: strip_id, params })
+}
+
+#[tauri::command]
+fn set_pan_params(data: tauri::State<AppData>, strip_id: StripId, params: PanParams) -> Result<(), String> {
+    send(&data, EngineCommand::SetPanParams { strip: strip_id, params })
 }
 
 #[tauri::command]
@@ -197,6 +202,7 @@ fn main() {
             set_gate_params,
             set_comp_params,
             set_eq_params,
+            set_pan_params,
             set_limiter_params,
             set_strip_device,
             set_bus_target,

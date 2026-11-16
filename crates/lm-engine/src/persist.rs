@@ -135,6 +135,7 @@ mod tests {
             gate: GateParams::default(),
             comp: Default::default(),
             eq: EqParams::default(),
+            pan: Default::default(),
             vban: (kind == StripKind::Vban).then(Default::default),
         }
     }

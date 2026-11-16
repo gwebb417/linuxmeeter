@@ -5,7 +5,22 @@
  * design iteration feels like the real app.
  */
 import type { AppState, BusId, MeterFrame, StripState, VbanRecv, VbanSend } from "./types";
-import { BUS_EQ_BANDS, BUS_IDS, LABEL_MAX, MAX_STRIPS, VBAN_DEFAULT_PORT, VBAN_STREAM_NAME_MAX, defaultPan, isOutputBus } from "./types";
+import {
+  BUS_EQ_BANDS,
+  BUS_IDS,
+  ECHO_DELAY_MS,
+  ECHO_FEEDBACK_MAX,
+  FX_KINDS,
+  LABEL_MAX,
+  MAX_STRIPS,
+  REVERB_DECAY_MS,
+  VBAN_DEFAULT_PORT,
+  VBAN_STREAM_NAME_MAX,
+  defaultFx,
+  defaultPan,
+  defaultSends,
+  isOutputBus,
+} from "./types";
 import type { Ipc, Target } from "./ipc";
 import { powerSum } from "./utils/db";
 
@@ -94,12 +109,13 @@ function cleanLabel(raw: string): string | null {
 const state: AppState = {
   profileName: "Default",
   takeDefaultOutput: false,
+  fx: FX_KINDS.map(defaultFx),
   strips: [
-    { id: 1, kind: "hardware", label: "Mic", hwKey: "alsa_input.usb-ZOOM_Corporation_UAC-2", online: true, gainDb: -4, mute: false, solo: false, routes: routes(["A2", "B1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), pan: defaultPan(), vban: null },
-    { id: 2, kind: "hardware", label: "Line In", hwKey: "alsa_input.pci-0000_31_00.4.analog-stereo", online: true, gainDb: -12, mute: false, solo: false, routes: routes(["A1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), pan: defaultPan(), vban: null },
-    { id: 3, kind: "virtual", label: "System", hwKey: null, online: true, gainDb: 0, mute: false, solo: false, routes: routes(["A1", "A2"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), pan: defaultPan(), vban: null },
-    { id: 4, kind: "virtual", label: "Music", hwKey: null, online: true, gainDb: -3.2, mute: false, solo: false, routes: routes(["A1", "A2", "B1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), pan: defaultPan(), vban: null },
-    { id: 5, kind: "virtual", label: "Chat", hwKey: null, online: true, gainDb: -6, mute: false, solo: false, routes: routes(["A2", "B1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), pan: defaultPan(), vban: null },
+    { id: 1, kind: "hardware", label: "Mic", hwKey: "alsa_input.usb-ZOOM_Corporation_UAC-2", online: true, gainDb: -4, mute: false, solo: false, routes: routes(["A2", "B1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), pan: defaultPan(), sends: defaultSends(), vban: null },
+    { id: 2, kind: "hardware", label: "Line In", hwKey: "alsa_input.pci-0000_31_00.4.analog-stereo", online: true, gainDb: -12, mute: false, solo: false, routes: routes(["A1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), pan: defaultPan(), sends: defaultSends(), vban: null },
+    { id: 3, kind: "virtual", label: "System", hwKey: null, online: true, gainDb: 0, mute: false, solo: false, routes: routes(["A1", "A2"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), pan: defaultPan(), sends: defaultSends(), vban: null },
+    { id: 4, kind: "virtual", label: "Music", hwKey: null, online: true, gainDb: -3.2, mute: false, solo: false, routes: routes(["A1", "A2", "B1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), pan: defaultPan(), sends: defaultSends(), vban: null },
+    { id: 5, kind: "virtual", label: "Chat", hwKey: null, online: true, gainDb: -6, mute: false, solo: false, routes: routes(["A2", "B1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), pan: defaultPan(), sends: defaultSends(), vban: null },
   ],
   buses: [
     { id: "A1", label: "Speakers", targetHwKey: "alsa_output.pci-0000_2f_00.1.hdmi-stereo", online: true, gainDb: 0, mute: false, limiter: defaultLimiter(), eq: { enabled: false, bands: structuredClone(BUS_EQ_BANDS) }, vban: defaultVbanSend("A1") },
@@ -196,7 +212,15 @@ function startSim(): void {
     });
     const busFrames: number[][] = state.buses.map((b) => {
       const inputs = state.strips.filter((s) => s.routes[b.id]).map((s) => levels.get(s.id)!);
-      const sum = b.mute ? -90 : powerSum(inputs) + b.gainDb;
+      // Effect returns routed here carry each strip's send (roughly: level x send x return).
+      const returns = state.fx
+        .filter((f) => !f.mute && f.routes[b.id])
+        .flatMap((f) =>
+          state.strips
+            .filter((s) => s.sends[f.kind] > 0)
+            .map((s) => levels.get(s.id)! + 20 * Math.log10(s.sends[f.kind]) + f.returnDb),
+        );
+      const sum = b.mute ? -90 : powerSum([...inputs, ...returns]) + b.gainDb;
       return [sum + 0.4, sum - 0.4, sum - 2.5, sum - 2.7];
     });
 
@@ -251,6 +275,35 @@ export const mockIpc: Ipc = {
     if (s) s.pan = { ...params, balance: Math.max(-1, Math.min(1, params.balance)) };
     return Promise.resolve();
   },
+  setSends: (stripId, sends) => {
+    const s = findStrip(stripId);
+    const c = (v: number) => (Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0);
+    if (s) s.sends = { reverb: c(sends.reverb), echo: c(sends.echo) };
+    return Promise.resolve();
+  },
+  setFx: (fx) => {
+    const cur = state.fx.find((f) => f.kind === fx.kind);
+    if (!cur) return Promise.resolve();
+    // Mirrors lm_protocol::FxState::validated.
+    const [tmin, tmax] = fx.kind === "reverb" ? REVERB_DECAY_MS : ECHO_DELAY_MS;
+    const amax = fx.kind === "reverb" ? 1 : ECHO_FEEDBACK_MAX;
+    const clamp = (v: number, lo: number, hi: number, d: number) => (Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : d);
+    const d = defaultFx(fx.kind);
+    Object.assign(cur, {
+      returnDb: clamp(fx.returnDb, -60, 6, d.returnDb),
+      mute: fx.mute,
+      timeMs: clamp(fx.timeMs, tmin, tmax, d.timeMs),
+      amount: clamp(fx.amount, 0, amax, d.amount),
+    });
+    broadcast();
+    return Promise.resolve();
+  },
+  setFxRoute: (kind, bus, on) => {
+    const f = state.fx.find((x) => x.kind === kind);
+    if (f && state.buses.some((b) => b.id === bus)) f.routes[bus] = on;
+    broadcast();
+    return Promise.resolve();
+  },
   setBusEqParams: (bus, params) => {
     const b = state.buses.find((x) => x.id === bus);
     if (b) b.eq = plain(params);
@@ -302,7 +355,7 @@ export const mockIpc: Ipc = {
       routes: routes(["A1"]),
       gate: defaultGate(),
       comp: defaultComp(),
-      eq: defaultEq(), pan: defaultPan(),
+      eq: defaultEq(), pan: defaultPan(), sends: defaultSends(),
       vban: cfg,
     });
     sims.set(id, makeSim("music", -16, 5, Math.random() * 6));
@@ -352,7 +405,7 @@ export const mockIpc: Ipc = {
       routes: routes([]),
       gate: defaultGate(),
       comp: defaultComp(),
-      eq: defaultEq(), pan: defaultPan(),
+      eq: defaultEq(), pan: defaultPan(), sends: defaultSends(),
       vban: null,
     });
     sims.set(id, makeSim(kind === "hardware" ? "speech" : "music", -20, 6, Math.random() * 6));
@@ -376,6 +429,7 @@ export const mockIpc: Ipc = {
     state.buses.push(bus);
     state.buses.sort((a, b) => BUS_IDS.indexOf(a.id) - BUS_IDS.indexOf(b.id));
     for (const s of state.strips) s.routes[id] ??= false;
+    for (const f of state.fx) f.routes[id] ??= false;
     broadcast();
     return Promise.resolve();
   },
@@ -385,6 +439,7 @@ export const mockIpc: Ipc = {
     if (idx < 0) return Promise.resolve();
     state.buses.splice(idx, 1);
     for (const s of state.strips) delete s.routes[bus];
+    for (const f of state.fx) delete f.routes[bus];
     broadcast();
     return Promise.resolve();
   },

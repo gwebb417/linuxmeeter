@@ -357,7 +357,7 @@ fn strip(id: u32) -> StripState {
         gate: Default::default(),
         comp: Default::default(),
         eq: Default::default(),
-        pan: Default::default(),
+        pan: Default::default(), sends: Default::default(),
         vban: None,
     };
     s.gain_db = 0.0;
@@ -622,6 +622,75 @@ fn bus_eq_boost_raises_the_bus_level() {
     let strip_after = rig.measure(&strip_meter, 500)[0];
     assert!((after - before - 6.0).abs() < 1.5, "bus moved {:.2} dB, wanted +6 ({before:.1} -> {after:.1})", after - before);
     assert!((strip_after - strip_before).abs() < 1.0, "the strip must be unaffected ({strip_before:.1} -> {strip_after:.1})");
+}
+
+/// Echo and reverb are fed by the strips' send channels (surround pairs matched by
+/// the router): with a send at zero the effect's return is silent; turned
+/// up, the effect produces sound. Uses the engine's Props keys.
+#[test]
+#[ignore = "requires a PipeWire daemon; run with `make test-audio`"]
+fn sends_feed_echo_and_reverb() {
+    use lm_protocol::{FxKind, FxState};
+    let mut rig = Rig::new();
+    let s = strip(1);
+    rig.want_control(&s.control_node());
+    rig.want_control(&FxKind::Echo.in_node());
+    rig.want_control(&FxKind::Reverb.in_node());
+    rig.load(&virtual_strip_args(&s.node_base(), &s.label, false));
+    rig.load(&lm_engine::filterchain::echo_args());
+    let ir = lm_engine::fx::write_reverb_ir(800.0, 0.5).expect("write impulse response");
+    rig.load(&lm_engine::filterchain::reverb_args(&ir.to_string_lossy()));
+    rig.settle(500);
+
+    rig.tone("lm.test.tone", 1000.0, 0.5);
+    rig.settle(200);
+    rig.route("lm.test.tone", &s.node_base(), true);
+    rig.route(&s.out_node(), SINK, true);
+    for k in FxKind::ALL {
+        rig.route(&s.out_node(), &k.in_node(), true);
+        // A real consumer, as a bus would be; meter taps alone are passive.
+        rig.route(&k.out_node(), SINK, true);
+    }
+    let echo_meter = rig.tap("test-echo", &FxKind::Echo.out_node());
+    let reverb_meter = rig.tap("test-reverb", &FxKind::Reverb.out_node());
+    rig.settle(500);
+    make_transparent(&rig, &s.control_node());
+
+    // Echo times and repeat levels as the engine sets them.
+    let echo = FxState::default_for(FxKind::Echo);
+    let mut pairs: Vec<(String, f32)> = Vec::new();
+    for side in ['l', 'r'] {
+        for (i, g) in echo.echo_tap_gains().iter().enumerate() {
+            pairs.push((format!("d{side}{}:Delay (s)", i + 1), echo.time_ms / 1000.0 * (i + 1) as f32));
+            pairs.push((format!("m{side}:Gain {}", i + 1), *g));
+        }
+    }
+    let borrowed: Vec<(&str, f32)> = pairs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    rig.set_props(&FxKind::Echo.in_node(), &params::filter_params(&borrowed));
+    for k in FxKind::ALL {
+        rig.set_props(&k.in_node(), &params::channel_volumes(1.0));
+    }
+    rig.settle(1500); // longer than the last echo tap
+
+    let quiet_echo = rig.measure(&echo_meter, 500)[0];
+    let quiet_reverb = rig.measure(&reverb_meter, 500)[0];
+    assert!(quiet_echo < -60.0, "echo must be silent with its send at zero ({quiet_echo:.1})");
+    assert!(quiet_reverb < -60.0, "reverb must be silent with its send at zero ({quiet_reverb:.1})");
+
+    let sends = |rv: f32, ec: f32| {
+        params::filter_params(&[("rvl:Gain 1", rv), ("rvr:Gain 1", rv), ("ecl:Gain 1", ec), ("ecr:Gain 1", ec)])
+    };
+    rig.set_props(&s.control_node(), &sends(0.0, 1.0));
+    rig.settle(1600);
+    let [el, er, ..] = rig.measure(&echo_meter, 500);
+    let reverb_still = rig.measure(&reverb_meter, 300)[0];
+    assert!(el > -30.0 && er > -30.0, "echo send produced no echo ({el:.1}/{er:.1})");
+    assert!(reverb_still < -60.0, "the echo send must not reach the reverb ({reverb_still:.1})");
+
+    rig.set_props(&s.control_node(), &sends(1.0, 0.0));
+    rig.settle(1200);
+    let [rl, rr, ..] = rig.measure(&reverb_meter, 500);
+    assert!(rl > -40.0 && rr > -40.0, "reverb send produced no reverb ({rl:.1}/{rr:.1})");
 }
 
 /// Mute must actually silence the audio, not just grey out a button.

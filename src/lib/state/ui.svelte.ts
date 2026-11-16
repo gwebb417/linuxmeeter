@@ -10,6 +10,8 @@ class UiStore {
   dynStrip = $state<number | null>(null);
   /** VBAN network streams panel. */
   vbanOpen = $state(false);
+  /** Effects (reverb / echo) panel. */
+  fxOpen = $state(false);
 }
 
 export const ui = new UiStore();

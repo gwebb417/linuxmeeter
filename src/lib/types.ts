@@ -95,6 +95,43 @@ export const BUS_EQ_BANDS: EqBand[] = [
   { kind: "high_shelf", freqHz: 12000, gainDb: 0, q: 0.7 },
 ];
 
+/** The shared effects (mirrors lm_protocol::FxKind). */
+export type FxKind = "reverb" | "echo";
+export const FX_KINDS: FxKind[] = ["reverb", "echo"];
+
+/** A strip's send levels, linear 0..1, post-fader and post-pan. */
+export interface FxSends {
+  reverb: number;
+  echo: number;
+}
+export const defaultSends = (): FxSends => ({ reverb: 0, echo: 0 });
+
+/** Mirrors lm_protocol::{REVERB_DECAY_MS, ECHO_DELAY_MS, ECHO_FEEDBACK_MAX}. */
+export const REVERB_DECAY_MS = [300, 6000] as const;
+export const ECHO_DELAY_MS = [20, 1500] as const;
+export const ECHO_FEEDBACK_MAX = 0.9;
+
+/** One shared effect (mirrors lm_protocol::FxState). */
+export interface FxState {
+  kind: FxKind;
+  returnDb: number;
+  mute: boolean;
+  routes: Partial<Record<BusId, boolean>>;
+  /** Reverb: decay (RT60). Echo: time between repeats. */
+  timeMs: number;
+  /** Reverb: damping 0..1. Echo: feedback 0..ECHO_FEEDBACK_MAX. */
+  amount: number;
+}
+
+export const defaultFx = (kind: FxKind): FxState => ({
+  kind,
+  returnDb: -6,
+  mute: false,
+  routes: { A1: true },
+  timeMs: kind === "reverb" ? 1800 : 350,
+  amount: kind === "reverb" ? 0.5 : 0.4,
+});
+
 /** A strip's stereo image, applied after the EQ (mirrors lm_protocol::PanParams). */
 export interface PanParams {
   /** Sum to mono (wins over reverse). */
@@ -123,6 +160,7 @@ export interface StripState {
   comp: CompParams;
   eq: EqParams;
   pan: PanParams;
+  sends: FxSends;
   /** Receiver config; non-null exactly for "vban" strips. */
   vban: VbanRecv | null;
 }
@@ -155,6 +193,8 @@ export interface AppState {
   profileName: string;
   /** True while linuxmeeter's System strip is the system default output. */
   takeDefaultOutput: boolean;
+  /** Reverb then echo. */
+  fx: FxState[];
 }
 
 /** One batched meter update, ~30/s. Channel layout: [peakL, peakR, rmsL, rmsR] in dBFS. */

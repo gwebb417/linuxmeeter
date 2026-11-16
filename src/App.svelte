@@ -7,6 +7,7 @@
   import EqPanel from "./components/EqPanel.svelte";
   import DynPanel from "./components/DynPanel.svelte";
   import VbanPanel from "./components/VbanPanel.svelte";
+  import FxPanel from "./components/FxPanel.svelte";
   import { BUS_EQ_BANDS, STRIP_EQ_BANDS } from "./lib/types";
 
   onMount(() => {
@@ -52,6 +53,9 @@
 {/if}
 {#if ui.vbanOpen && mixer.ready}
   <VbanPanel />
+{/if}
+{#if ui.fxOpen && mixer.ready}
+  <FxPanel />
 {/if}
 {#if mixer.notice}
   <div class="notice" role="alert">{mixer.notice}</div>

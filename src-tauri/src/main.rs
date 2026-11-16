@@ -4,8 +4,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use lm_protocol::{
-    AppState, BusId, CompParams, EngineCommand, EngineEvent, EqParams, GateParams, LimiterParams,
-    PanParams, StripId, StripKind, Target, VbanRecv, VbanSend,
+    AppState, BusId, CompParams, EngineCommand, EngineEvent, EqParams, FxKind, FxSends, FxState, GateParams,
+    LimiterParams, PanParams, StripId, StripKind, Target, VbanRecv, VbanSend,
 };
 use tauri::{Emitter, Manager};
 
@@ -68,6 +68,21 @@ fn set_eq_params(data: tauri::State<AppData>, strip_id: StripId, params: EqParam
 #[tauri::command]
 fn set_pan_params(data: tauri::State<AppData>, strip_id: StripId, params: PanParams) -> Result<(), String> {
     send(&data, EngineCommand::SetPanParams { strip: strip_id, params })
+}
+
+#[tauri::command]
+fn set_sends(data: tauri::State<AppData>, strip_id: StripId, sends: FxSends) -> Result<(), String> {
+    send(&data, EngineCommand::SetSends { strip: strip_id, sends })
+}
+
+#[tauri::command]
+fn set_fx(data: tauri::State<AppData>, fx: FxState) -> Result<(), String> {
+    send(&data, EngineCommand::SetFx { fx })
+}
+
+#[tauri::command]
+fn set_fx_route(data: tauri::State<AppData>, fx: FxKind, bus: BusId, on: bool) -> Result<(), String> {
+    send(&data, EngineCommand::SetFxRoute { fx, bus, on })
 }
 
 #[tauri::command]
@@ -209,6 +224,9 @@ fn main() {
             set_eq_params,
             set_pan_params,
             set_bus_eq_params,
+            set_sends,
+            set_fx,
+            set_fx_route,
             set_limiter_params,
             set_strip_device,
             set_bus_target,

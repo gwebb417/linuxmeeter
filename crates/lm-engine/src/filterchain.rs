@@ -62,13 +62,18 @@ const LV2_COMP: &str = "http://lsp-plug.in/plugins/lv2/compressor_stereo";
 const LV2_EQ: &str = "http://lsp-plug.in/plugins/lv2/para_equalizer_x8_stereo";
 const LV2_LIMITER: &str = "http://lsp-plug.in/plugins/lv2/limiter_stereo";
 
-/// Every input strip's DSP: gate → comp → EQ → stereo image.
+/// Every input strip's DSP: gate → comp → EQ → stereo image → sends.
 ///
 /// The stereo image (mono / reverse / balance) is a 2x2 gain matrix built from
 /// two builtin mixers: `panl` produces the left output from (L, R) and `panr`
 /// the right. Their `Gain 1` / `Gain 2` controls are the matrix rows from
 /// [`lm_protocol::PanParams::matrix`]; the defaults here are the identity, so
 /// a strip passes audio unchanged until the engine says otherwise.
+///
+/// The effect sends are one-input mixers off the panned signal (so they
+/// follow fader, mute and pan): `rvl`/`rvr` for reverb, `ecl`/`ecr` for echo,
+/// silent until the engine sets their gain. They leave the strip as four
+/// extra output channels, see [`STRIP_OUT_POSITIONS`].
 pub fn strip_graph() -> serde_json::Value {
     json!({
         "nodes": [
@@ -77,6 +82,14 @@ pub fn strip_graph() -> serde_json::Value {
             { "type": "lv2", "name": "eq",   "plugin": LV2_EQ },
             { "type": "builtin", "name": "panl", "label": "mixer", "control": { "Gain 1": 1.0, "Gain 2": 0.0 } },
             { "type": "builtin", "name": "panr", "label": "mixer", "control": { "Gain 1": 0.0, "Gain 2": 1.0 } },
+            { "type": "builtin", "name": "rvl", "label": "mixer", "control": { "Gain 1": 0.0 } },
+            { "type": "builtin", "name": "rvr", "label": "mixer", "control": { "Gain 1": 0.0 } },
+            { "type": "builtin", "name": "ecl", "label": "mixer", "control": { "Gain 1": 0.0 } },
+            { "type": "builtin", "name": "ecr", "label": "mixer", "control": { "Gain 1": 0.0 } },
+            // A port that is a graph output can't also feed other nodes, so
+            // the main pair leaves through copies of the pan outputs.
+            { "type": "builtin", "name": "outl", "label": "copy" },
+            { "type": "builtin", "name": "outr", "label": "copy" },
         ],
         "links": [
             { "output": "gate:out_l", "input": "comp:in_l" },
@@ -88,9 +101,118 @@ pub fn strip_graph() -> serde_json::Value {
             { "output": "eq:out_r", "input": "panl:In 2" },
             { "output": "eq:out_l", "input": "panr:In 1" },
             { "output": "eq:out_r", "input": "panr:In 2" },
+            { "output": "panl:Out", "input": "rvl:In 1" },
+            { "output": "panr:Out", "input": "rvr:In 1" },
+            { "output": "panl:Out", "input": "ecl:In 1" },
+            { "output": "panr:Out", "input": "ecr:In 1" },
+            { "output": "panl:Out", "input": "outl:In" },
+            { "output": "panr:Out", "input": "outr:In" },
         ],
         "inputs":  [ "gate:in_l", "gate:in_r" ],
-        "outputs": [ "panl:Out", "panr:Out" ],
+        "outputs": [ "outl:Out", "outr:Out", "rvl:Out", "rvr:Out", "ecl:Out", "ecr:Out" ],
+    })
+}
+
+/// Channel layout of a strip's output stream: the main stereo pair, then the
+/// reverb and echo sends ([`lm_protocol::FxKind::send_channels`]). Buses only
+/// have FL/FR inputs and each effect only its surround pair, so channel-matched routing
+/// sends each pair exactly where it belongs.
+pub const STRIP_OUT_POSITIONS: [&str; 6] = ["FL", "FR", "SL", "SR", "RL", "RR"];
+
+/// Module args for the shared reverb: stereo convolution with an impulse
+/// response from [`crate::fx::write_reverb_ir`] (left and right channels of
+/// the file are decorrelated tails). Input is the strips' reverb sends.
+pub fn reverb_args(ir_path: &str) -> String {
+    let fx = lm_protocol::FxKind::Reverb;
+    json!({
+        "node.description": "Reverb",
+        "media.name": "Reverb",
+        "filter.graph": {
+            "nodes": [
+                { "type": "builtin", "name": "cvl", "label": "convolver", "config": { "filename": ir_path, "channel": 0 } },
+                { "type": "builtin", "name": "cvr", "label": "convolver", "config": { "filename": ir_path, "channel": 1 } },
+            ],
+            "inputs":  [ "cvl:In", "cvr:In" ],
+            "outputs": [ "cvl:Out", "cvr:Out" ],
+        },
+        "capture.props": fx_in_props(fx, "Reverb"),
+        "playback.props": fx_out_props(fx, "Reverb"),
+    })
+    .to_string()
+}
+
+/// Longest echo the delay lines are sized for (the last tap of the longest delay).
+pub const ECHO_MAX_DELAY_S: f32 = lm_protocol::ECHO_DELAY_MS.1 / 1000.0 * lm_protocol::ECHO_TAPS as f32;
+
+/// Module args for the shared echo: per channel, the input fans out to
+/// [`lm_protocol::ECHO_TAPS`] delay lines at 1x, 2x, 3x, 4x the echo time
+/// (`dl1`..`dl4` left, `dr1`..`dr4` right), summed by a mixer (`ml`/`mr`)
+/// whose gains are the decaying repeat levels. Delays and gains are runtime
+/// controls; the defaults are silent until the engine sets them.
+pub fn echo_args() -> String {
+    let fx = lm_protocol::FxKind::Echo;
+    // The builtin mixer's gains default to 1; start silent instead.
+    let silent: serde_json::Map<String, serde_json::Value> =
+        (1..=lm_protocol::ECHO_TAPS).map(|i| (format!("Gain {i}"), json!(0.0))).collect();
+    let mut nodes = vec![
+        json!({ "type": "builtin", "name": "inl", "label": "copy" }),
+        json!({ "type": "builtin", "name": "inr", "label": "copy" }),
+        json!({ "type": "builtin", "name": "ml", "label": "mixer", "control": silent }),
+        json!({ "type": "builtin", "name": "mr", "label": "mixer", "control": silent }),
+    ];
+    let mut links = Vec::new();
+    for side in ['l', 'r'] {
+        for tap in 1..=lm_protocol::ECHO_TAPS {
+            let d = format!("d{side}{tap}");
+            nodes.push(json!({
+                "type": "builtin", "name": d, "label": "delay",
+                "config": { "max-delay": ECHO_MAX_DELAY_S },
+                "control": { "Delay (s)": 0.0 },
+            }));
+            links.push(json!({ "output": format!("in{side}:Out"), "input": format!("{d}:In") }));
+            links.push(json!({ "output": format!("{d}:Out"), "input": format!("m{side}:In {tap}") }));
+        }
+    }
+    json!({
+        "node.description": "Echo",
+        "media.name": "Echo",
+        "filter.graph": {
+            "nodes": nodes,
+            "links": links,
+            "inputs":  [ "inl:In", "inr:In" ],
+            "outputs": [ "ml:Out", "mr:Out" ],
+        },
+        "capture.props": fx_in_props(fx, "Echo"),
+        "playback.props": fx_out_props(fx, "Echo"),
+    })
+    .to_string()
+}
+
+/// An effect's input: a hidden stream whose channels are the strips' send
+/// channels for that effect, so only those ports link to it.
+fn fx_in_props(fx: lm_protocol::FxKind, label: &str) -> serde_json::Value {
+    json!({
+        "node.name": fx.in_node(),
+        "node.description": format!("{label} (in)"),
+        "media.class": "Stream/Input/Audio",
+        "audio.position": fx.send_channels(),
+        "node.autoconnect": false,
+        "node.dont-reconnect": true,
+        "node.virtual": true,
+        "state.restore-props": false,
+    })
+}
+
+fn fx_out_props(fx: lm_protocol::FxKind, label: &str) -> serde_json::Value {
+    json!({
+        "node.name": fx.out_node(),
+        "node.description": format!("{label} (return)"),
+        "media.class": "Stream/Output/Audio",
+        "audio.position": [ "FL", "FR" ],
+        "node.autoconnect": false,
+        "node.dont-reconnect": true,
+        "node.virtual": true,
+        "state.restore-props": false,
     })
 }
 
@@ -106,6 +228,7 @@ pub fn strip_graph() -> serde_json::Value {
 pub fn virtual_strip_args(sink_name: &str, label: &str, autoconnect_output: bool) -> String {
     let mut playback_props = json!({
         "node.name": format!("{sink_name}.out"),
+        "audio.position": STRIP_OUT_POSITIONS,
         "node.description": format!("{label} (out)"),
         "media.class": "Stream/Output/Audio",
         "node.virtual": true,
@@ -151,6 +274,7 @@ pub fn hardware_strip_args(strip_name: &str, label: &str, hw_target: &str) -> St
         },
         "playback.props": {
             "node.name": format!("{strip_name}.out"),
+            "audio.position": STRIP_OUT_POSITIONS,
             "node.description": format!("{label} (out)"),
             "media.class": "Stream/Output/Audio",
             "node.autoconnect": false,
@@ -183,6 +307,7 @@ pub fn vban_strip_args(strip_name: &str, label: &str) -> String {
         },
         "playback.props": {
             "node.name": format!("{strip_name}.out"),
+            "audio.position": STRIP_OUT_POSITIONS,
             "node.description": format!("{label} (out)"),
             "media.class": "Stream/Output/Audio",
             "node.autoconnect": false,
@@ -559,11 +684,87 @@ mod tests {
             .iter()
             .map(|n| n["name"].as_str().expect("node name"))
             .collect();
-        assert_eq!(names, ["gate", "comp", "eq", "panl", "panr"]);
+        assert_eq!(names, ["gate", "comp", "eq", "panl", "panr", "rvl", "rvr", "ecl", "ecr", "outl", "outr"]);
         // The Props keys the engine writes are "<node>:<port>"; these prefixes
         // are the contract between filterchain.rs and engine.rs.
         assert_eq!(v["filter.graph"]["inputs"][0], "gate:in_l");
-        assert_eq!(v["filter.graph"]["outputs"], json!(["panl:Out", "panr:Out"]));
+        assert_eq!(
+            v["filter.graph"]["outputs"],
+            json!(["outl:Out", "outr:Out", "rvl:Out", "rvr:Out", "ecl:Out", "ecr:Out"])
+        );
+    }
+
+    /// REGRESSION: a port listed as a graph output must not also feed another
+    /// node. The pan outputs once did both (main mix and sends) and every
+    /// strip went silent. No graph output may appear as a link source.
+    #[test]
+    fn graph_outputs_are_not_also_link_sources() {
+        let g = strip_graph();
+        let outs: Vec<&str> = g["outputs"].as_array().unwrap().iter().map(|o| o.as_str().unwrap()).collect();
+        for l in g["links"].as_array().unwrap() {
+            assert!(!outs.contains(&l["output"].as_str().unwrap()), "{} is a graph output and a link source", l["output"]);
+        }
+    }
+
+    /// The output channel layout is what makes routing work: graph outputs map
+    /// to these positions in order, buses take FL/FR, each effect its own pair.
+    #[test]
+    fn strip_outputs_carry_main_mix_then_sends() {
+        for args in [
+            virtual_strip_args("s", "S", false),
+            hardware_strip_args("s", "S", "alsa_input.x"),
+            vban_strip_args("s", "S"),
+        ] {
+            let v = parse(&args);
+            assert_eq!(v["playback.props"]["audio.position"], json!(STRIP_OUT_POSITIONS));
+            assert_eq!(v["filter.graph"]["outputs"].as_array().unwrap().len(), STRIP_OUT_POSITIONS.len());
+        }
+        assert_eq!(&STRIP_OUT_POSITIONS[2..4], &lm_protocol::FxKind::Reverb.send_channels());
+        assert_eq!(&STRIP_OUT_POSITIONS[4..6], &lm_protocol::FxKind::Echo.send_channels());
+    }
+
+    /// Sends are taken after the pan matrix and start silent.
+    #[test]
+    fn sends_follow_the_pan_stage_and_start_silent() {
+        let g = strip_graph();
+        let links = g["links"].as_array().unwrap();
+        for (out, inp) in [("panl:Out", "rvl:In 1"), ("panr:Out", "rvr:In 1"), ("panl:Out", "ecl:In 1"), ("panr:Out", "ecr:In 1")] {
+            assert!(links.contains(&json!({ "output": out, "input": inp })), "missing {out} -> {inp}");
+        }
+        for n in g["nodes"].as_array().unwrap().iter().filter(|n| ["rvl", "rvr", "ecl", "ecr"].contains(&n["name"].as_str().unwrap())) {
+            assert_eq!(n["control"]["Gain 1"], 0.0, "{} must start silent", n["name"]);
+        }
+    }
+
+    #[test]
+    fn reverb_convolves_each_channel_of_the_ir() {
+        let v = parse(&reverb_args("/tmp/ir.wav"));
+        let nodes = v["filter.graph"]["nodes"].as_array().unwrap();
+        assert_eq!(nodes[0]["label"], "convolver");
+        assert_eq!(nodes[0]["config"], json!({ "filename": "/tmp/ir.wav", "channel": 0 }));
+        assert_eq!(nodes[1]["config"]["channel"], 1);
+        assert_eq!(v["capture.props"]["node.name"], "lm.fx.reverb.in");
+        assert_eq!(v["capture.props"]["audio.position"], json!(["SL", "SR"]));
+        assert_eq!(v["playback.props"]["node.name"], "lm.fx.reverb.out");
+        assert_eq!(v["playback.props"]["audio.position"], json!(["FL", "FR"]));
+        assert_eq!(v["playback.props"]["node.autoconnect"], false);
+    }
+
+    #[test]
+    fn echo_is_four_delay_taps_per_side_into_a_mixer() {
+        let v = parse(&echo_args());
+        let g = &v["filter.graph"];
+        let delays: Vec<&Value> = g["nodes"].as_array().unwrap().iter().filter(|n| n["label"] == "delay").collect();
+        assert_eq!(delays.len(), 2 * lm_protocol::ECHO_TAPS);
+        assert!(delays.iter().all(|d| d["config"]["max-delay"].as_f64().unwrap() >= 6.0), "room for 4 x 1.5 s");
+        assert!(delays.iter().all(|d| d["control"]["Delay (s)"] == 0.0));
+        let links = g["links"].as_array().unwrap();
+        assert!(links.contains(&json!({ "output": "inl:Out", "input": "dl1:In" })));
+        assert!(links.contains(&json!({ "output": "dr4:Out", "input": "mr:In 4" })));
+        assert_eq!(g["inputs"], json!(["inl:In", "inr:In"]));
+        assert_eq!(g["outputs"], json!(["ml:Out", "mr:Out"]));
+        assert_eq!(v["capture.props"]["audio.position"], json!(["RL", "RR"]));
+        assert_eq!(v["playback.props"]["node.name"], "lm.fx.echo.out");
     }
 
     /// All three strip kinds share one graph, so a DSP stage can't go missing

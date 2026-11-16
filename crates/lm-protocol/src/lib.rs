@@ -220,6 +220,159 @@ impl PanParams {
     }
 }
 
+// ---- effects (echo / reverb sends) -----------------------------------------
+
+/// The two shared effects, VoiceMeeter Potato style: every strip has a send
+/// knob for each, and each effect's return feeds whichever buses it is
+/// routed to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FxKind {
+    Reverb,
+    Echo,
+}
+
+impl FxKind {
+    pub const ALL: [FxKind; 2] = [FxKind::Reverb, FxKind::Echo];
+
+    /// `lm.fx.reverb` / `lm.fx.echo`.
+    pub fn node_base(&self) -> String {
+        format!("lm.fx.{}", self.key())
+    }
+
+    pub fn key(&self) -> &'static str {
+        match self {
+            FxKind::Reverb => "reverb",
+            FxKind::Echo => "echo",
+        }
+    }
+
+    /// The effect's input stream (also carries return volume/mute Props).
+    pub fn in_node(&self) -> String {
+        format!("{}.in", self.node_base())
+    }
+
+    /// The effect's output stream, routed to buses.
+    pub fn out_node(&self) -> String {
+        format!("{}.out", self.node_base())
+    }
+
+    /// The strip-output channels that carry this effect's send. The router
+    /// pairs ports by channel name, so a strip's FL/FR reach buses and each
+    /// surround pair reaches exactly the matching effect. (Not AUXn: PipeWire's
+    /// channel converter drops AUX-positioned channels, which silenced the
+    /// sends; the surround names pass through untouched.)
+    pub fn send_channels(&self) -> [&'static str; 2] {
+        match self {
+            FxKind::Reverb => ["SL", "SR"],
+            FxKind::Echo => ["RL", "RR"],
+        }
+    }
+}
+
+/// A strip's effect sends, as linear gains 0..=1 (post-fader, post-pan).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct FxSends {
+    pub reverb: f32,
+    pub echo: f32,
+}
+
+impl Default for FxSends {
+    fn default() -> Self {
+        Self { reverb: 0.0, echo: 0.0 }
+    }
+}
+
+impl FxSends {
+    pub fn get(&self, kind: FxKind) -> f32 {
+        let v = match kind {
+            FxKind::Reverb => self.reverb,
+            FxKind::Echo => self.echo,
+        };
+        if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 }
+    }
+}
+
+/// Reverb decay (RT60) range, milliseconds.
+pub const REVERB_DECAY_MS: (f32, f32) = (300.0, 6000.0);
+/// Echo delay range, milliseconds.
+pub const ECHO_DELAY_MS: (f32, f32) = (20.0, 1500.0);
+/// Highest echo feedback (level of each repeat relative to the one before).
+pub const ECHO_FEEDBACK_MAX: f32 = 0.9;
+/// Echo repeats (delay taps).
+pub const ECHO_TAPS: usize = 4;
+
+/// One shared effect: its return level and routing plus its own settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FxState {
+    pub kind: FxKind,
+    /// Return level in dB.
+    pub return_db: f32,
+    pub mute: bool,
+    /// Buses the return feeds.
+    #[serde(default)]
+    pub routes: BTreeMap<BusId, bool>,
+    /// Reverb: decay time (RT60). Echo: time between repeats.
+    pub time_ms: f32,
+    /// Reverb: high-frequency damping 0..1 (darker tail). Echo: feedback
+    /// 0..[`ECHO_FEEDBACK_MAX`] (how loud each repeat is).
+    pub amount: f32,
+}
+
+impl FxState {
+    pub fn default_for(kind: FxKind) -> Self {
+        let (time_ms, amount) = match kind {
+            FxKind::Reverb => (1800.0, 0.5),
+            FxKind::Echo => (350.0, 0.4),
+        };
+        Self {
+            kind,
+            return_db: -6.0,
+            mute: false,
+            routes: [(BusId::A1, true)].into_iter().collect(),
+            time_ms,
+            amount,
+        }
+    }
+
+    pub fn defaults() -> Vec<FxState> {
+        FxKind::ALL.into_iter().map(Self::default_for).collect()
+    }
+
+    /// Clamp settings into range (non-finite values take the defaults).
+    pub fn validated(&self) -> Self {
+        let d = Self::default_for(self.kind);
+        let fin = |v: f32, dflt: f32| if v.is_finite() { v } else { dflt };
+        let (tmin, tmax, amax) = match self.kind {
+            FxKind::Reverb => (REVERB_DECAY_MS.0, REVERB_DECAY_MS.1, 1.0),
+            FxKind::Echo => (ECHO_DELAY_MS.0, ECHO_DELAY_MS.1, ECHO_FEEDBACK_MAX),
+        };
+        Self {
+            kind: self.kind,
+            return_db: fin(self.return_db, d.return_db).clamp(-60.0, 6.0),
+            mute: self.mute,
+            routes: self.routes.clone(),
+            time_ms: fin(self.time_ms, d.time_ms).clamp(tmin, tmax),
+            amount: fin(self.amount, d.amount).clamp(0.0, amax),
+        }
+    }
+
+    /// Echo tap gains: the first repeat at full level, each later one scaled
+    /// by the feedback (1, fb, fb², ...). Zero feedback is a single slapback.
+    pub fn echo_tap_gains(&self) -> [f32; ECHO_TAPS] {
+        let fb = if self.amount.is_finite() { self.amount.clamp(0.0, ECHO_FEEDBACK_MAX) } else { 0.0 };
+        let mut g = [0.0; ECHO_TAPS];
+        let mut v = 1.0;
+        for x in &mut g {
+            *x = v;
+            v *= fb;
+        }
+        g
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LimiterParams {
@@ -371,6 +524,9 @@ pub struct StripState {
     /// `default` so profiles written before panning existed still load.
     #[serde(default)]
     pub pan: PanParams,
+    /// Echo / reverb send levels; none in older profiles.
+    #[serde(default)]
+    pub sends: FxSends,
     /// Receiver config; Some exactly for [`StripKind::Vban`] strips.
     #[serde(default)]
     pub vban: Option<VbanRecv>,
@@ -465,6 +621,9 @@ pub struct AppState {
     pub profile_name: String,
     /// True while linuxmeeter's System strip is the system default output.
     pub take_default_output: bool,
+    /// The shared effects, one per [`FxKind`], in `FxKind::ALL` order.
+    #[serde(default = "FxState::defaults")]
+    pub fx: Vec<FxState>,
 }
 
 /// One batched meter update, ~30/s. Channel layout: [peakL, peakR, rmsL, rmsR]
@@ -496,6 +655,13 @@ pub enum EngineCommand {
     SetCompParams { strip: StripId, params: CompParams },
     SetEqParams { strip: StripId, params: EqParams },
     SetPanParams { strip: StripId, params: PanParams },
+    /// A strip's echo / reverb send levels.
+    SetSends { strip: StripId, sends: FxSends },
+    /// An effect's return level, mute and settings (`routes` is ignored;
+    /// use [`EngineCommand::SetFxRoute`]).
+    SetFx { fx: FxState },
+    /// Route an effect's return to a bus.
+    SetFxRoute { fx: FxKind, bus: BusId, on: bool },
     SetLimiterParams { bus: BusId, params: LimiterParams },
     SetBusEqParams { bus: BusId, params: EqParams },
     /// Point a hardware strip at a different capture device (module reload).
@@ -559,7 +725,7 @@ mod tests {
             gate: GateParams::default(),
             comp: CompParams::default(),
             eq: EqParams::default(),
-            pan: Default::default(),
+            pan: Default::default(), sends: Default::default(),
             vban: (kind == StripKind::Vban).then(VbanRecv::default),
         }
     }
@@ -655,6 +821,7 @@ mod tests {
             }],
             profile_name: "Default".into(),
             take_default_output: true,
+            fx: FxState::defaults(),
         })
         .expect("serialize");
 
@@ -724,6 +891,9 @@ mod tests {
             EngineCommand::RemoveStrip { strip: 9 },
             EngineCommand::AddStrip { kind: StripKind::Hardware, label: "Guitar".into() },
             EngineCommand::AddBus { output: true },
+            EngineCommand::SetSends { strip: 1, sends: FxSends { reverb: 0.3, echo: 0.0 } },
+            EngineCommand::SetFx { fx: FxState::default_for(FxKind::Reverb) },
+            EngineCommand::SetFxRoute { fx: FxKind::Echo, bus: BusId::B1, on: true },
             EngineCommand::SetBusEqParams { bus: BusId::B2, params: EqParams::bus_default() },
             EngineCommand::SetPanParams { strip: 2, params: PanParams { mono: true, ..Default::default() } },
             EngineCommand::RemoveBus { bus: BusId::A4 },
@@ -801,6 +971,76 @@ mod tests {
         assert_eq!(clean_label(&"x".repeat(50)).map(|s| s.len()), Some(LABEL_MAX));
         assert_eq!(clean_label("   "), None);
         assert_eq!(clean_label("Café ♪").as_deref(), Some("Café ♪"), "labels may be any printable text");
+    }
+
+    // ---- effects -----------------------------------------------------------
+
+    #[test]
+    fn fx_names_and_channels() {
+        assert_eq!(serde_json::to_value(FxKind::Reverb).unwrap(), "reverb");
+        assert_eq!(FxKind::Echo.in_node(), "lm.fx.echo.in");
+        assert_eq!(FxKind::Reverb.out_node(), "lm.fx.reverb.out");
+        // Each effect owns its own channels, and none collide with the main mix.
+        let all: Vec<&str> = FxKind::ALL.iter().flat_map(|k| k.send_channels()).collect();
+        assert_eq!(all, ["SL", "SR", "RL", "RR"]);
+        assert!(all.iter().all(|c| !c.starts_with("AUX")), "AUX channels are dropped by PipeWire's converter");
+    }
+
+    #[test]
+    fn echo_repeats_start_full_and_decay_by_the_feedback() {
+        let mut e = FxState::default_for(FxKind::Echo);
+        e.amount = 0.5;
+        assert_eq!(e.echo_tap_gains(), [1.0, 0.5, 0.25, 0.125]);
+        e.amount = 0.0;
+        assert_eq!(e.echo_tap_gains(), [1.0, 0.0, 0.0, 0.0], "no feedback = a single slapback");
+        e.amount = 3.0;
+        assert!(e.echo_tap_gains()[1] <= ECHO_FEEDBACK_MAX, "feedback is capped");
+    }
+
+    #[test]
+    fn fx_settings_are_clamped_into_range() {
+        let wild = FxState { time_ms: 1e9, amount: -4.0, return_db: 99.0, ..FxState::default_for(FxKind::Reverb) };
+        let v = wild.validated();
+        assert_eq!(v.time_ms, REVERB_DECAY_MS.1);
+        assert_eq!(v.amount, 0.0);
+        assert_eq!(v.return_db, 6.0);
+        let nan = FxState { time_ms: f32::NAN, ..FxState::default_for(FxKind::Echo) }.validated();
+        assert_eq!(nan.time_ms, FxState::default_for(FxKind::Echo).time_ms);
+        let echo = FxState { time_ms: 5.0, ..FxState::default_for(FxKind::Echo) }.validated();
+        assert_eq!(echo.time_ms, ECHO_DELAY_MS.0);
+    }
+
+    #[test]
+    fn sends_read_back_clamped() {
+        let s = FxSends { reverb: 1.7, echo: f32::NAN };
+        assert_eq!(s.get(FxKind::Reverb), 1.0);
+        assert_eq!(s.get(FxKind::Echo), 0.0);
+        assert_eq!(FxSends::default().get(FxKind::Reverb), 0.0, "sends start off");
+    }
+
+    /// New effects default to feeding A1 only, at -6 dB, unmuted.
+    #[test]
+    fn fx_defaults() {
+        let d = FxState::defaults();
+        assert_eq!(d.iter().map(|f| f.kind).collect::<Vec<_>>(), FxKind::ALL);
+        assert!(d.iter().all(|f| f.routes == [(BusId::A1, true)].into_iter().collect() && !f.mute && f.return_db == -6.0));
+        assert_eq!(d[0].validated(), d[0], "defaults are already in range");
+        assert_eq!(d[1].validated(), d[1]);
+    }
+
+    /// An AppState from before effects (or from a hand-written test client)
+    /// still deserializes, with both effects present.
+    #[test]
+    fn app_state_without_fx_gets_the_defaults() {
+        let s: AppState = serde_json::from_value(serde_json::json!({
+            "strips": [], "buses": [], "devices": [], "profileName": "x", "takeDefaultOutput": false
+        }))
+        .unwrap();
+        assert_eq!(s.fx, FxState::defaults());
+        let keys = serde_json::to_value(FxState::default_for(FxKind::Echo)).unwrap();
+        for k in ["kind", "returnDb", "mute", "routes", "timeMs", "amount"] {
+            assert!(keys.get(k).is_some(), "fx is missing {k}");
+        }
     }
 
     // ---- bus EQ ------------------------------------------------------------

@@ -11,6 +11,8 @@
     autostart = await ipc.getAutostart();
   });
   let vbanActive = $derived(mixer.buses.some((b) => b.vban.enabled) || mixer.strips.some((s) => s.kind === "vban"));
+  // Lit while any strip sends to an effect.
+  let fxActive = $derived(mixer.strips.some((s) => s.sends.reverb > 0 || s.sends.echo > 0));
 
   function toggleAutostart() {
     autostart = !autostart;
@@ -62,6 +64,14 @@
       onclick={() => (ui.vbanOpen = true)}
     >
       VBAN
+    </button>
+    <button
+      class="toggle"
+      class:active={fxActive}
+      title="Effects: reverb and echo returns, their settings and which buses they feed"
+      onclick={() => (ui.fxOpen = true)}
+    >
+      FX
     </button>
   </div>
   <button class="iconbtn" title="Settings">

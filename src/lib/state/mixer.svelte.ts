@@ -11,6 +11,9 @@ import type {
   CompParams,
   DeviceInfo,
   EqParams,
+  FxKind,
+  FxSends,
+  FxState,
   GateParams,
   LimiterParams,
   PanParams,
@@ -27,6 +30,7 @@ class MixerStore {
   devices = $state<DeviceInfo[]>([]);
   profileName = $state("Default");
   takeDefaultOutput = $state(false);
+  fx = $state<FxState[]>([]);
   ready = $state(false);
   error = $state<string | null>(null);
   /** Last rejected command from the engine (shown briefly, then cleared). */
@@ -93,6 +97,7 @@ class MixerStore {
     this.devices = s.devices;
     this.profileName = s.profileName;
     this.takeDefaultOutput = s.takeDefaultOutput;
+    this.fx = s.fx ?? [];
   }
 
   #find(t: Target): StripState | BusState | undefined {
@@ -172,6 +177,25 @@ class MixerStore {
     const s = this.strip(stripId);
     if (s) s.pan = params;
     void ipc.setPanParams(stripId, params);
+  }
+
+  setSends(stripId: number, sends: FxSends): void {
+    const s = this.strip(stripId);
+    if (s) s.sends = sends;
+    void ipc.setSends(stripId, sends);
+  }
+
+  /** Optimistic; the engine clamps out-of-range values and resends state. */
+  setFx(fx: FxState): void {
+    const i = this.fx.findIndex((f) => f.kind === fx.kind);
+    if (i >= 0) this.fx[i] = { ...fx, routes: this.fx[i]!.routes };
+    void ipc.setFx(fx);
+  }
+
+  setFxRoute(kind: FxKind, bus: BusId, on: boolean): void {
+    const f = this.fx.find((x) => x.kind === kind);
+    if (f) f.routes[bus] = on;
+    void ipc.setFxRoute(kind, bus, on);
   }
 
   setBusEqParams(bus: BusId, params: EqParams): void {

@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use lm_protocol::{
     clean_label, AppState, BusId, BusState, CompParams, DeviceInfo, EngineCommand, EngineEvent, EqParams,
-    GateParams, LimiterParams, StripId, StripKind, StripState, Target, VbanRecv, VbanSend, MAX_STRIPS,
+    FxKind, FxState, GateParams, LimiterParams, StripId, StripKind, StripState, Target, VbanRecv, VbanSend,
+    MAX_STRIPS,
 };
 use pipewire::context::ContextRc;
 use pipewire::core::CoreRc;
@@ -24,8 +25,8 @@ use pipewire::proxy::Listener as ProxyListener;
 use pipewire::types::ObjectType;
 
 use crate::filterchain::{
-    bus_args, hardware_strip_args, vban_recv_args, vban_recv_has_rules, vban_send_args, vban_strip_args,
-    virtual_strip_args, LoadedModule, VbanRecvStream,
+    bus_args, echo_args, hardware_strip_args, reverb_args, vban_recv_args, vban_recv_has_rules, vban_send_args,
+    vban_strip_args, virtual_strip_args, LoadedModule, VbanRecvStream,
 };
 use crate::links::LinkManager;
 use crate::meter::MeterTap;
@@ -64,6 +65,8 @@ struct Engine {
     vban_send_modules: HashMap<BusId, LoadedModule>,
     /// One VBAN receiver per UDP port, serving every VBAN strip on that port.
     vban_recv_modules: HashMap<u16, LoadedModule>,
+    /// The shared echo / reverb filter-chains.
+    fx_modules: HashMap<FxKind, LoadedModule>,
     /// The running PipeWire's vban-recv supports `stream.rules` (≥ 1.4).
     vban_rules: bool,
     /// Index-aligned with `app.strips` (None if that tap failed to create),
@@ -108,6 +111,7 @@ impl Engine {
         }
         let profile = crate::persist::Profile {
             take_default_output: self.app.take_default_output,
+            fx: self.app.fx.clone(),
             strips: self.app.strips.clone(),
             buses: self.app.buses.clone(),
         };
@@ -152,6 +156,7 @@ impl Engine {
             self.app.strips = p.strips;
             self.app.buses = p.buses;
             self.app.take_default_output = p.take_default_output;
+            self.app.fx = p.fx;
             self.app.profile_name = profile_name;
             for s in &mut self.app.strips {
                 if s.kind == StripKind::Hardware {
@@ -198,7 +203,7 @@ impl Engine {
                 gate: GateParams::default(),
                 comp: CompParams::default(),
                 eq: EqParams::default(),
-                pan: Default::default(),
+                pan: Default::default(), sends: Default::default(),
                 vban: None,
             });
             next_id += 1;
@@ -217,7 +222,7 @@ impl Engine {
                 gate: GateParams::default(),
                 comp: CompParams::default(),
                 eq: EqParams::default(),
-                pan: Default::default(),
+                pan: Default::default(), sends: Default::default(),
                 vban: None,
             });
             next_id += 1;
@@ -231,6 +236,7 @@ impl Engine {
         self.app.strips = strips;
         self.app.buses = buses;
         self.app.profile_name = "Default".into();
+        self.app.fx = FxState::defaults();
         self.finish_build();
     }
 
@@ -276,6 +282,21 @@ impl Engine {
         }
         for id in BusId::ALL {
             self.apply_bus_vban(id);
+        }
+
+        // Effects: every strip's sends feed both units; returns go to buses.
+        for kind in FxKind::ALL {
+            self.load_fx(kind);
+        }
+        let outs: Vec<String> = self.app.strips.iter().map(|s| s.out_node()).collect();
+        for out in &outs {
+            self.route_sends(out, true);
+        }
+        for fx in self.app.fx.clone() {
+            for b in &self.app.buses {
+                let on = fx.routes.get(&b.id).copied().unwrap_or(false);
+                self.links.set_route(&fx.kind.out_node(), &b.in_node(), on);
+            }
         }
 
         self.built = true;
@@ -344,6 +365,101 @@ impl Engine {
                 None
             }
         }
+    }
+
+    // ---- effects -------------------------------------------------------------
+
+    fn fx_state(&self, kind: FxKind) -> Option<&FxState> {
+        self.app.fx.iter().find(|f| f.kind == kind)
+    }
+
+    /// (Re)load an effect's filter-chain. The reverb's impulse response is
+    /// generated from its settings first. Node names are stable, so sends and
+    /// returns re-link by themselves.
+    fn load_fx(&mut self, kind: FxKind) {
+        let Some(fx) = self.fx_state(kind).cloned() else { return };
+        self.nodes.remove(&kind.in_node());
+        self.fx_modules.remove(&kind);
+        let args = match kind {
+            FxKind::Reverb => match crate::fx::write_reverb_ir(fx.time_ms, fx.amount) {
+                Ok(path) => reverb_args(&path.to_string_lossy()),
+                Err(e) => {
+                    let msg = format!("reverb impulse response could not be written: {e}");
+                    let _ = self.evt_tx.send(EngineEvent::Error(msg.clone()));
+                    return tracing::error!("{msg}");
+                }
+            },
+            FxKind::Echo => echo_args(),
+        };
+        match LoadedModule::load(&self.context, "libpipewire-module-filter-chain", &args) {
+            Ok(m) => {
+                self.fx_modules.insert(kind, m);
+            }
+            Err(e) => tracing::error!("{} failed to load: {e}", kind.key()),
+        }
+        self.wanted_controls.insert(kind.in_node());
+    }
+
+    /// A strip's output feeds every effect (its send levels decide how much).
+    fn route_sends(&mut self, strip_out: &str, on: bool) {
+        for kind in FxKind::ALL {
+            self.links.set_route(strip_out, &kind.in_node(), on);
+        }
+    }
+
+    fn apply_sends(&self, strip: &StripState) {
+        let (rv, ec) = (strip.sends.get(FxKind::Reverb), strip.sends.get(FxKind::Echo));
+        let pairs: Vec<(&str, f32)> =
+            vec![("rvl:Gain 1", rv), ("rvr:Gain 1", rv), ("ecl:Gain 1", ec), ("ecr:Gain 1", ec)];
+        self.set_props(&strip.control_node(), &params::filter_params(&pairs));
+    }
+
+    /// Return level and mute ride on the effect's input stream (the effects
+    /// are linear, so input gain is output gain); echo times and repeat
+    /// levels are controls of its delay lines and mixers.
+    fn apply_fx(&self, kind: FxKind) {
+        let Some(fx) = self.fx_state(kind) else { return };
+        let node = kind.in_node();
+        self.set_props(&node, &params::channel_volumes(params::db_to_linear(fx.return_db)));
+        self.set_props(&node, &params::mute(fx.mute));
+        if kind == FxKind::Echo {
+            let step = fx.time_ms / 1000.0;
+            let gains = fx.echo_tap_gains();
+            let mut pairs: Vec<(String, f32)> = Vec::new();
+            for side in ['l', 'r'] {
+                for (i, g) in gains.iter().enumerate() {
+                    pairs.push((format!("d{side}{}:Delay (s)", i + 1), step * (i + 1) as f32));
+                    pairs.push((format!("m{side}:Gain {}", i + 1), *g));
+                }
+            }
+            let borrowed: Vec<(&str, f32)> = pairs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+            self.set_props(&node, &params::filter_params(&borrowed));
+        }
+    }
+
+    fn set_fx(&mut self, fx: FxState) {
+        let fx = fx.validated();
+        let Some(cur) = self.app.fx.iter_mut().find(|f| f.kind == fx.kind) else { return };
+        let reload = fx.kind == FxKind::Reverb && (cur.time_ms != fx.time_ms || cur.amount != fx.amount);
+        let routes = std::mem::take(&mut cur.routes);
+        *cur = FxState { routes, ..fx.clone() };
+        if reload {
+            self.load_fx(fx.kind);
+            self.reconcile();
+        } else {
+            self.apply_fx(fx.kind);
+        }
+        self.send_state();
+    }
+
+    fn set_fx_route(&mut self, kind: FxKind, bus: BusId, on: bool) {
+        let Some(b) = self.app.buses.iter().find(|b| b.id == bus).map(|b| b.in_node()) else { return };
+        if let Some(fx) = self.app.fx.iter_mut().find(|f| f.kind == kind) {
+            fx.routes.insert(bus, on);
+        }
+        self.links.set_route(&kind.out_node(), &b, on);
+        self.reconcile();
+        self.send_state();
     }
 
     fn make_bus_tap(&mut self, b: &BusState) -> Option<MeterTap> {
@@ -487,7 +603,7 @@ impl Engine {
             gate: GateParams::default(),
             comp: CompParams::default(),
             eq: EqParams::default(),
-            pan: Default::default(),
+            pan: Default::default(), sends: Default::default(),
             vban: Some(cfg.clone()),
         };
         self.app.strips.push(strip.clone());
@@ -500,6 +616,7 @@ impl Engine {
         }
         let tap = self.make_strip_tap(&strip);
         self.strip_taps.push(tap);
+        self.route_sends(&strip.out_node(), true);
         self.reload_vban_port(cfg.port);
         self.reconcile();
         self.send_state();
@@ -582,13 +699,14 @@ impl Engine {
             gate: GateParams::default(),
             comp: CompParams::default(),
             eq: EqParams::default(),
-            pan: Default::default(),
+            pan: Default::default(), sends: Default::default(),
             vban: None,
         };
         self.app.strips.push(strip.clone());
         self.load_strip_module(&strip);
         let tap = self.make_strip_tap(&strip);
         self.strip_taps.push(tap);
+        self.route_sends(&strip.out_node(), true);
         self.reconcile();
         self.send_state();
     }
@@ -613,6 +731,9 @@ impl Engine {
         self.app.buses.insert(idx, b.clone());
         for s in &mut self.app.strips {
             s.routes.entry(id).or_insert(false);
+        }
+        for fx in &mut self.app.fx {
+            fx.routes.entry(id).or_insert(false);
         }
         self.load_bus_module(&b);
         let tap = self.make_bus_tap(&b);
@@ -640,6 +761,12 @@ impl Engine {
             s.routes.remove(&id);
         }
         self.links.set_route(&b.tap_node(), &b.vban_node(), false);
+        for kind in FxKind::ALL {
+            self.links.set_route(&kind.out_node(), &b.in_node(), false);
+        }
+        for fx in &mut self.app.fx {
+            fx.routes.remove(&id);
+        }
         self.vban_send_modules.remove(&id);
         self.reconcile();
         drop(tap);
@@ -693,6 +820,7 @@ impl Engine {
             self.links.set_route(&s.out_node(), &b.in_node(), false);
         }
         self.links.set_route(&s.vban_node(), &s.node_base(), false);
+        self.route_sends(&s.out_node(), false);
         self.reconcile();
         drop(tap);
         self.nodes.remove(&s.control_node());
@@ -723,6 +851,7 @@ impl Engine {
         }
         self.vban_send_modules.clear();
         self.vban_recv_modules.clear();
+        self.fx_modules.clear();
         self.strip_taps.clear();
         self.bus_taps.clear();
         self.nodes.clear();
@@ -862,6 +991,7 @@ impl Engine {
             self.apply_comp(s);
             self.apply_eq(s);
             self.apply_pan(s);
+            self.apply_sends(s);
             self.apply_strip_mutes();
         }
         if let Some(b) = self.app.buses.iter().find(|b| b.in_node() == node_name) {
@@ -869,6 +999,9 @@ impl Engine {
             self.apply_bus_eq(b);
             self.apply_limiter(b);
             self.apply_bus_mute(b.id);
+        }
+        if let Some(kind) = FxKind::ALL.into_iter().find(|k| k.in_node() == node_name) {
+            self.apply_fx(kind);
         }
     }
 
@@ -974,6 +1107,17 @@ impl Engine {
                 }
                 self.dirty = true;
             }
+            EngineCommand::SetSends { strip, sends } => {
+                if let Some(s) = self.app.strips.iter_mut().find(|s| s.id == strip) {
+                    s.sends = sends;
+                }
+                if let Some(s) = self.app.strips.iter().find(|s| s.id == strip) {
+                    self.apply_sends(s);
+                }
+                self.dirty = true;
+            }
+            EngineCommand::SetFx { fx } => self.set_fx(fx),
+            EngineCommand::SetFxRoute { fx, bus, on } => self.set_fx_route(fx, bus, on),
             EngineCommand::SetBusEqParams { bus, params } => {
                 if let Some(b) = self.app.buses.iter_mut().find(|b| b.id == bus) {
                     b.eq = params;
@@ -1172,6 +1316,7 @@ fn run(
         bus_modules: HashMap::new(),
         vban_send_modules: HashMap::new(),
         vban_recv_modules: HashMap::new(),
+        fx_modules: HashMap::new(),
         vban_rules,
         strip_taps: Vec::new(),
         bus_taps: Vec::new(),

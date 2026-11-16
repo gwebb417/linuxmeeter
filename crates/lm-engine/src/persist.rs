@@ -17,6 +17,9 @@ pub struct Profile {
     pub take_default_output: bool,
     pub strips: Vec<StripState>,
     pub buses: Vec<BusState>,
+    /// Echo / reverb settings; absent from profiles that predate them.
+    #[serde(default = "lm_protocol::FxState::defaults")]
+    pub fx: Vec<lm_protocol::FxState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +110,16 @@ fn sanitize(p: &mut Profile) {
     // Strip ids key node names; a duplicate would fight over one node.
     let mut seen = std::collections::HashSet::new();
     p.strips.retain(|s| seen.insert(s.id));
+    // Exactly one of each effect, in FxKind::ALL order, settings in range.
+    p.fx = lm_protocol::FxKind::ALL
+        .into_iter()
+        .map(|k| {
+            p.fx.iter()
+                .find(|f| f.kind == k)
+                .map(|f| f.validated())
+                .unwrap_or_else(|| lm_protocol::FxState::default_for(k))
+        })
+        .collect();
 }
 
 fn atomic_write(path: &std::path::Path, contents: &str) -> io::Result<()> {
@@ -142,7 +155,7 @@ mod tests {
             gate: GateParams::default(),
             comp: Default::default(),
             eq: EqParams::default(),
-            pan: Default::default(),
+            pan: Default::default(), sends: Default::default(),
             vban: (kind == StripKind::Vban).then(Default::default),
         }
     }
@@ -162,6 +175,7 @@ mod tests {
                 eq: EqParams::bus_default(),
                 vban: Default::default(),
             }],
+            fx: lm_protocol::FxState::defaults(),
         }
     }
 
@@ -301,6 +315,8 @@ releaseMs = 50.0
         sanitize(&mut back);
         assert_eq!(back.strips[0].eq.bands.len(), 8, "defaults then migration give a full band set");
         assert!(!back.buses[0].vban.enabled, "an old profile must not start sending VBAN");
+        assert_eq!(back.fx, lm_protocol::FxState::defaults(), "pre-effects profiles get both effects");
+        assert_eq!(back.strips[0].sends, lm_protocol::FxSends::default(), "and no sends");
         assert_eq!(back.strips[0].vban, None);
     }
 
@@ -352,6 +368,34 @@ releaseMs = 50.0
         let ids: Vec<BusId> = p.buses.iter().map(|b| b.id).collect();
         assert_eq!(ids, [BusId::A1, BusId::A4, BusId::B1, BusId::B3]);
         assert_eq!(p.strips.len(), 1, "a duplicate strip id would fight over one node name");
+    }
+
+    /// Effects: missing kinds come back with defaults, duplicates go, order is
+    /// FxKind::ALL, and wild values are pulled into range.
+    #[test]
+    fn sanitize_normalizes_the_effects() {
+        use lm_protocol::{FxKind, FxState};
+        let mut p = profile(vec![strip(1, StripKind::Virtual)]);
+        let mut echo = FxState::default_for(FxKind::Echo);
+        echo.amount = 5.0;
+        echo.time_ms = f32::NAN;
+        p.fx = vec![echo.clone(), echo];
+        sanitize(&mut p);
+        assert_eq!(p.fx.iter().map(|f| f.kind).collect::<Vec<_>>(), FxKind::ALL);
+        assert_eq!(p.fx[0], FxState::default_for(FxKind::Reverb), "missing reverb restored");
+        assert_eq!(p.fx[1].amount, lm_protocol::ECHO_FEEDBACK_MAX);
+        assert_eq!(p.fx[1].time_ms, FxState::default_for(FxKind::Echo).time_ms);
+    }
+
+    #[test]
+    fn effects_and_sends_survive_a_toml_round_trip() {
+        let mut p = profile(vec![strip(1, StripKind::Virtual)]);
+        p.strips[0].sends = lm_protocol::FxSends { reverb: 0.4, echo: 0.25 };
+        p.fx[1].time_ms = 500.0;
+        p.fx[1].routes.insert(BusId::B1, true);
+        let back: Profile = toml::from_str(&toml::to_string_pretty(&p).unwrap()).unwrap();
+        assert_eq!(back.strips[0].sends, p.strips[0].sends);
+        assert_eq!(back.fx, p.fx);
     }
 
     #[test]

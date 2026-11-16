@@ -109,6 +109,36 @@ describe("EQ edits", () => {
   });
 });
 
+describe("effects", () => {
+  it("starts with both effects returning to A1 and no sends", async () => {
+    const s = await ipc.getState();
+    expect(s.fx.map((f) => f.kind)).toEqual(["reverb", "echo"]);
+    expect(s.fx.every((f) => f.routes.A1 && !f.mute)).toBe(true);
+    expect(s.strips.every((x) => x.sends.reverb === 0 && x.sends.echo === 0)).toBe(true);
+  });
+
+  it("clamps settings like the engine", async () => {
+    await ipc.setFx({ kind: "echo", returnDb: 40, mute: false, routes: {}, timeMs: 99999, amount: 3 });
+    await ipc.setSends(3, { reverb: 1.8, echo: -1 });
+    const s = await ipc.getState();
+    const echo = s.fx.find((f) => f.kind === "echo")!;
+    expect(echo.returnDb).toBe(6);
+    expect(echo.timeMs).toBe(1500);
+    expect(echo.amount).toBe(0.9);
+    expect(echo.routes.A1).toBe(true); // setFx leaves routing alone
+    expect(s.strips.find((x) => x.id === 3)!.sends).toEqual({ reverb: 1, echo: 0 });
+  });
+
+  it("routes returns only to buses that exist, and forgets removed ones", async () => {
+    await ipc.setFxRoute("reverb", "A5", true); // no A5 yet
+    await ipc.setFxRoute("reverb", "B1", true);
+    await ipc.removeBus("B1");
+    const reverb = (await ipc.getState()).fx[0]!;
+    expect(reverb.routes.A5).toBeUndefined();
+    expect("B1" in reverb.routes).toBe(false);
+  });
+});
+
 describe("labels", () => {
   it("renames strips and buses, trimmed and bounded", async () => {
     await ipc.setLabel({ strip: 3 }, "  Game  ");

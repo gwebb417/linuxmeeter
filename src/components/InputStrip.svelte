@@ -105,6 +105,26 @@
 
   <ColorPad {strip} />
   <PanRow pan={strip.pan} onchange={(p) => mixer.setPanParams(strip.id, p)} />
+  <div class="sends" role="group" aria-label="Effect sends">
+    <Knob
+      label="REVERB"
+      min={0}
+      max={1}
+      value={strip.sends.reverb}
+      defaultValue={0}
+      fmt={(v) => `${Math.round(v * 100)}%`}
+      onchange={(v) => mixer.setSends(strip.id, { ...strip.sends, reverb: Math.round(v * 100) / 100 })}
+    />
+    <Knob
+      label="ECHO"
+      min={0}
+      max={1}
+      value={strip.sends.echo}
+      defaultValue={0}
+      fmt={(v) => `${Math.round(v * 100)}%`}
+      onchange={(v) => mixer.setSends(strip.id, { ...strip.sends, echo: Math.round(v * 100) / 100 })}
+    />
+  </div>
 
   <div class="sep"></div>
   <RoutingToggleGroup
@@ -156,6 +176,10 @@
     justify-content: space-between;
     align-items: flex-start;
     padding: 0 2px;
+  }
+  .sends {
+    display: flex;
+    justify-content: space-around;
   }
   .panelbtns {
     display: flex;

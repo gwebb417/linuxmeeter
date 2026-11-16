@@ -23,6 +23,11 @@ OBS, or any recorder can use.
 
 - **Stereo image per strip** — VoiceMeeter-style **MONO** and **⇄**
   (swap left/right) buttons plus a balance slider, applied after the EQ
+- **Reverb and echo** — **REVERB** / **ECHO** send knobs on every strip
+  feed two shared effects; the **FX** panel sets each return's level, mute,
+  which buses it feeds, reverb decay and damping, and echo time and feedback.
+  Both run on PipeWire's built-in filters (the reverb's impulse response is
+  generated on the fly), so no extra plugins are needed
 - **Output buses** — up to five A buses (A1–A5) to hardware devices and
   three B buses (B1–B3) as **virtual microphones** (post-limiter) selectable
   in any app; add them with **+A** / **+B**. Every bus has an 8-band

@@ -8,6 +8,9 @@ import type {
   BusId,
   CompParams,
   EqParams,
+  FxKind,
+  FxSends,
+  FxState,
   GateParams,
   LimiterParams,
   MeterFrame,
@@ -30,6 +33,10 @@ export interface Ipc {
   setEqParams(stripId: number, params: EqParams): Promise<void>;
   setPanParams(stripId: number, params: PanParams): Promise<void>;
   setBusEqParams(bus: BusId, params: EqParams): Promise<void>;
+  setSends(stripId: number, sends: FxSends): Promise<void>;
+  /** Return level, mute and settings; `routes` is ignored (use setFxRoute). */
+  setFx(fx: FxState): Promise<void>;
+  setFxRoute(fx: FxKind, bus: BusId, on: boolean): Promise<void>;
   setLimiterParams(bus: BusId, params: LimiterParams): Promise<void>;
   setStripDevice(stripId: number, hwKey: string): Promise<void>;
   setBusTarget(bus: BusId, hwKey: string): Promise<void>;
@@ -76,6 +83,9 @@ function tauriIpc(): Ipc {
     setEqParams: (stripId, params) => invoke("set_eq_params", { stripId, params }),
     setPanParams: (stripId, params) => invoke("set_pan_params", { stripId, params }),
     setBusEqParams: (bus, params) => invoke("set_bus_eq_params", { bus, params }),
+    setSends: (stripId, sends) => invoke("set_sends", { stripId, sends }),
+    setFx: (fx) => invoke("set_fx", { fx }),
+    setFxRoute: (fx, bus, on) => invoke("set_fx_route", { fx, bus, on }),
     setLimiterParams: (bus, params) => invoke("set_limiter_params", { bus, params }),
     setStripDevice: (stripId, hwKey) => invoke("set_strip_device", { stripId, hwKey }),
     setBusTarget: (bus, hwKey) => invoke("set_bus_target", { bus, hwKey }),

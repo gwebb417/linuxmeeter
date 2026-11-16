@@ -3,7 +3,22 @@
  * In a browser (no Tauri runtime) or with VITE_MOCK=1 the mock backend is
  * used, so `pnpm dev` gives a fully animated console for design iteration.
  */
-import type { AppState, BusId, CompParams, EqParams, GateParams, LimiterParams, MeterFrame } from "./types";
+import type {
+  AppState,
+  BusId,
+  CompParams,
+  EqParams,
+  FxKind,
+  FxSends,
+  FxState,
+  GateParams,
+  LimiterParams,
+  MacroButton,
+  MeterFrame,
+  PanParams,
+  VbanRecv,
+  VbanSend,
+} from "./types";
 import { mockIpc } from "./mock";
 
 export type Target = { strip: number } | { bus: BusId };
@@ -17,9 +32,30 @@ export interface Ipc {
   setGateParams(stripId: number, params: GateParams): Promise<void>;
   setCompParams(stripId: number, params: CompParams): Promise<void>;
   setEqParams(stripId: number, params: EqParams): Promise<void>;
+  setPanParams(stripId: number, params: PanParams): Promise<void>;
+  setBusEqParams(bus: BusId, params: EqParams): Promise<void>;
+  setSends(stripId: number, sends: FxSends): Promise<void>;
+  /** Return level, mute and settings; `routes` is ignored (use setFxRoute). */
+  setFx(fx: FxState): Promise<void>;
+  setFxRoute(fx: FxKind, bus: BusId, on: boolean): Promise<void>;
+  /** Replace all macro buttons (from the editor). */
+  setMacros(macros: MacroButton[]): Promise<void>;
+  /** A macro button went down (pressed) or up. */
+  triggerMacro(id: number, pressed: boolean): Promise<void>;
   setLimiterParams(bus: BusId, params: LimiterParams): Promise<void>;
   setStripDevice(stripId: number, hwKey: string): Promise<void>;
   setBusTarget(bus: BusId, hwKey: string): Promise<void>;
+  setBusVban(bus: BusId, config: VbanSend): Promise<void>;
+  /** The new strip arrives via onStateChanged (the engine assigns its id). */
+  addVbanStrip(label: string, config: VbanRecv): Promise<void>;
+  setStripVban(stripId: number, label: string, config: VbanRecv): Promise<void>;
+  removeStrip(stripId: number): Promise<void>;
+  /** "hardware" captures the default input; "virtual" is a new playback device. */
+  addStrip(kind: "hardware" | "virtual", label: string): Promise<void>;
+  /** Adds the next free A (output: true) or B bus. */
+  addBus(output: boolean): Promise<void>;
+  removeBus(bus: BusId): Promise<void>;
+  setLabel(target: Target, label: string): Promise<void>;
   setDefaultOutput(on: boolean): Promise<void>;
   getAutostart(): Promise<boolean>;
   setAutostart(on: boolean): Promise<void>;
@@ -27,6 +63,8 @@ export interface Ipc {
   onMeters(cb: (frame: MeterFrame) => void): () => void;
   /** Backend-initiated state changes (device hotplug, external volume change…). */
   onStateChanged(cb: (state: AppState) => void): () => void;
+  /** Commands the engine rejected or could not carry out (bad VBAN address, port in use…). */
+  onError(cb: (message: string) => void): () => void;
 }
 
 export const IS_TAURI = "__TAURI_INTERNALS__" in window;
@@ -48,9 +86,24 @@ function tauriIpc(): Ipc {
     setGateParams: (stripId, params) => invoke("set_gate_params", { stripId, params }),
     setCompParams: (stripId, params) => invoke("set_comp_params", { stripId, params }),
     setEqParams: (stripId, params) => invoke("set_eq_params", { stripId, params }),
+    setPanParams: (stripId, params) => invoke("set_pan_params", { stripId, params }),
+    setBusEqParams: (bus, params) => invoke("set_bus_eq_params", { bus, params }),
+    setSends: (stripId, sends) => invoke("set_sends", { stripId, sends }),
+    setFx: (fx) => invoke("set_fx", { fx }),
+    setFxRoute: (fx, bus, on) => invoke("set_fx_route", { fx, bus, on }),
+    setMacros: (macros) => invoke("set_macros", { macros }),
+    triggerMacro: (id, pressed) => invoke("trigger_macro", { id, pressed }),
     setLimiterParams: (bus, params) => invoke("set_limiter_params", { bus, params }),
     setStripDevice: (stripId, hwKey) => invoke("set_strip_device", { stripId, hwKey }),
     setBusTarget: (bus, hwKey) => invoke("set_bus_target", { bus, hwKey }),
+    setBusVban: (bus, config) => invoke("set_bus_vban", { bus, config }),
+    addVbanStrip: (label, config) => invoke("add_vban_strip", { label, config }),
+    setStripVban: (stripId, label, config) => invoke("set_strip_vban", { stripId, label, config }),
+    removeStrip: (stripId) => invoke("remove_strip", { stripId }),
+    addStrip: (kind, label) => invoke("add_strip", { kind, label }),
+    addBus: (output) => invoke("add_bus", { output }),
+    removeBus: (bus) => invoke("remove_bus", { bus }),
+    setLabel: (target, label) => invoke("set_label", { target, label }),
     setDefaultOutput: (on) => invoke("set_default_output", { on }),
     getAutostart: () => invoke("get_autostart"),
     setAutostart: (on) => invoke("set_autostart", { on }),
@@ -60,6 +113,10 @@ function tauriIpc(): Ipc {
     },
     onStateChanged: (cb) => {
       const un = event.then((e) => e.listen<AppState>("state_changed", (ev) => cb(ev.payload)));
+      return () => void un.then((f) => f());
+    },
+    onError: (cb) => {
+      const un = event.then((e) => e.listen<string>("engine_error", (ev) => cb(ev.payload)));
       return () => void un.then((f) => f());
     },
   };

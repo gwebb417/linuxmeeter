@@ -4,8 +4,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use lm_protocol::{
-    AppState, BusId, CompParams, EngineCommand, EngineEvent, EqParams, GateParams, LimiterParams,
-    StripId, Target,
+    AppState, BusId, CompParams, EngineCommand, EngineEvent, EqParams, FxKind, FxSends, FxState, GateParams,
+    LimiterParams, MacroButton, PanParams, StripId, StripKind, Target, VbanRecv, VbanSend,
 };
 use tauri::{Emitter, Manager};
 
@@ -66,6 +66,41 @@ fn set_eq_params(data: tauri::State<AppData>, strip_id: StripId, params: EqParam
 }
 
 #[tauri::command]
+fn set_pan_params(data: tauri::State<AppData>, strip_id: StripId, params: PanParams) -> Result<(), String> {
+    send(&data, EngineCommand::SetPanParams { strip: strip_id, params })
+}
+
+#[tauri::command]
+fn set_sends(data: tauri::State<AppData>, strip_id: StripId, sends: FxSends) -> Result<(), String> {
+    send(&data, EngineCommand::SetSends { strip: strip_id, sends })
+}
+
+#[tauri::command]
+fn set_fx(data: tauri::State<AppData>, fx: FxState) -> Result<(), String> {
+    send(&data, EngineCommand::SetFx { fx })
+}
+
+#[tauri::command]
+fn set_fx_route(data: tauri::State<AppData>, fx: FxKind, bus: BusId, on: bool) -> Result<(), String> {
+    send(&data, EngineCommand::SetFxRoute { fx, bus, on })
+}
+
+#[tauri::command]
+fn set_macros(data: tauri::State<AppData>, macros: Vec<MacroButton>) -> Result<(), String> {
+    send(&data, EngineCommand::SetMacros { macros })
+}
+
+#[tauri::command]
+fn trigger_macro(data: tauri::State<AppData>, id: u32, pressed: bool) -> Result<(), String> {
+    send(&data, EngineCommand::TriggerMacro { id, pressed })
+}
+
+#[tauri::command]
+fn set_bus_eq_params(data: tauri::State<AppData>, bus: BusId, params: EqParams) -> Result<(), String> {
+    send(&data, EngineCommand::SetBusEqParams { bus, params })
+}
+
+#[tauri::command]
 fn set_limiter_params(data: tauri::State<AppData>, bus: BusId, params: LimiterParams) -> Result<(), String> {
     send(&data, EngineCommand::SetLimiterParams { bus, params })
 }
@@ -78,6 +113,51 @@ fn set_strip_device(data: tauri::State<AppData>, strip_id: StripId, hw_key: Stri
 #[tauri::command]
 fn set_bus_target(data: tauri::State<AppData>, bus: BusId, hw_key: String) -> Result<(), String> {
     send(&data, EngineCommand::SetBusTarget { bus, hw_key })
+}
+
+#[tauri::command]
+fn set_bus_vban(data: tauri::State<AppData>, bus: BusId, config: VbanSend) -> Result<(), String> {
+    send(&data, EngineCommand::SetBusVban { bus, config })
+}
+
+#[tauri::command]
+fn add_vban_strip(data: tauri::State<AppData>, label: String, config: VbanRecv) -> Result<(), String> {
+    send(&data, EngineCommand::AddVbanStrip { label, config })
+}
+
+#[tauri::command]
+fn set_strip_vban(
+    data: tauri::State<AppData>,
+    strip_id: StripId,
+    label: String,
+    config: VbanRecv,
+) -> Result<(), String> {
+    send(&data, EngineCommand::SetStripVban { strip: strip_id, label, config })
+}
+
+#[tauri::command]
+fn remove_strip(data: tauri::State<AppData>, strip_id: StripId) -> Result<(), String> {
+    send(&data, EngineCommand::RemoveStrip { strip: strip_id })
+}
+
+#[tauri::command]
+fn add_strip(data: tauri::State<AppData>, kind: StripKind, label: String) -> Result<(), String> {
+    send(&data, EngineCommand::AddStrip { kind, label })
+}
+
+#[tauri::command]
+fn add_bus(data: tauri::State<AppData>, output: bool) -> Result<(), String> {
+    send(&data, EngineCommand::AddBus { output })
+}
+
+#[tauri::command]
+fn remove_bus(data: tauri::State<AppData>, bus: BusId) -> Result<(), String> {
+    send(&data, EngineCommand::RemoveBus { bus })
+}
+
+#[tauri::command]
+fn set_label(data: tauri::State<AppData>, target: Target, label: String) -> Result<(), String> {
+    send(&data, EngineCommand::SetLabel { target, label })
 }
 
 #[tauri::command]
@@ -152,9 +232,24 @@ fn main() {
             set_gate_params,
             set_comp_params,
             set_eq_params,
+            set_pan_params,
+            set_bus_eq_params,
+            set_sends,
+            set_fx,
+            set_fx_route,
+            set_macros,
+            trigger_macro,
             set_limiter_params,
             set_strip_device,
             set_bus_target,
+            set_bus_vban,
+            add_vban_strip,
+            set_strip_vban,
+            remove_strip,
+            add_strip,
+            add_bus,
+            remove_bus,
+            set_label,
             set_default_output,
             get_autostart,
             set_autostart,
@@ -174,6 +269,9 @@ fn main() {
                             }
                             EngineEvent::Meters(f) => {
                                 let _ = handle.emit("meters", &f);
+                            }
+                            EngineEvent::Error(msg) => {
+                                let _ = handle.emit("engine_error", &msg);
                             }
                         }
                     }

@@ -6,9 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A VoiceMeeter-style virtual audio mixer for Linux: Tauri 2 shell + Svelte 5 frontend +
 a Rust PipeWire engine. Input strips (hardware capture or virtual sinks apps play into)
-run gate → comp → EQ, feed a routing matrix, and land on four buses (A1/A2 → hardware
-sinks, B1/B2 → virtual microphones). DSP is the LSP LV2 plugins hosted inside
-`libpipewire-module-filter-chain`.
+run gate → comp → EQ, feed a routing matrix, and land on buses (up to A1–A5 → hardware
+sinks, B1–B3 → virtual microphones; a profile holds any subset, always in that order).
+Strips and buses are added/removed/renamed at runtime; `strip_taps` / `bus_taps` stay
+index-aligned with `app.strips` / `app.buses` because meter frames are positional.
+DSP is the LSP LV2 plugins hosted inside `libpipewire-module-filter-chain`.
 
 ## Commands
 
@@ -61,9 +63,17 @@ set by the harness script — a bare `cargo test -- --ignored` fails fast rather
 creating real devices in the developer's own audio session. Because they share one
 daemon and one process environment, they run with `--test-threads=1`.
 
-Without a session manager nothing configures ports, so the harness sets
-`adapter.auto-port-config` for both the daemon's null sink and this process's streams.
-Without that, every node appears with zero ports and no link can ever form.
+Without a session manager nothing configures ports; without that, every node appears
+with zero ports and no link can ever form. The harness's null sink uses
+`adapter.auto-port-config`, with `audio.format`/`rate`/`channels` pinned: PipeWire 1.4.x
+parses the follower's EnumFormat before fixating it, so any unfixed field reads as 0 and
+the PortConfig is rejected (the sink silently stays in convert mode with one `UNK` port).
+Our own streams can't use that trick — filter-chain never puts a rate in its EnumFormat —
+so the harness exports `LM_TEST_NO_SESSION_MANAGER=1` and the rig's `PortConfigurator`
+sets a full DSP PortConfig on every `lm.*` node as it appears, as WirePlumber would. It
+runs on its **own** core connection: the daemon stops reading a client that set a node
+param until that node syncs, so setting it from the connection that owns the node
+(the tone, the meter taps) deadlocks silently.
 
 **Manual.** Perceptual quality, real hardware enumeration, and WirePlumber policy
 interactions are still eyes-and-ears work: `make graph` / `make spike` plus `pw-dump`,
@@ -139,6 +149,32 @@ the capture-side node (`.cap` for hardware strips, the sink node itself for virt
 
 Every `lm.*` node sets `state.restore-props: false`; without it WirePlumber's
 restore-stream overwrites our volumes and mutes as nodes appear.
+
+### VBAN (network audio)
+
+Both directions are PipeWire's own modules (`libpipewire-module-vban-send` /
+`-vban-recv`, PipeWire ≥ 0.3.76), loaded in-process through `LoadedModule` like the
+filter-chains. Args are built in `filterchain.rs`; every VBAN stream is
+`node.autoconnect=false` and linked by our `LinkManager`, never by WirePlumber.
+
+- **Send** is per bus (`BusState.vban`): one module, node `lm.bus.<id>.vban`, fed by a
+  route from `tap_node()` (post-limiter). Toggling or editing it is a module reload.
+  `destination.ip` must be an IP literal — the module uses `inet_pton`, not DNS.
+- **Receive** is a strip kind, `StripKind::Vban`: a gate→comp→EQ filter-chain whose
+  input is a hidden `Stream/Input/Audio` (`lm.strip.<id>`, also its `control_node`)
+  plus a route from the receiver stream `lm.strip.<id>.vban`. `online` tracks that
+  stream's existence. VBAN strips are the only strips that can be added/removed at
+  runtime, which is why `strip_taps` is `Vec<Option<MeterTap>>`, index-aligned with
+  `app.strips`.
+- **One receiver per UDP port** (only one socket can own it), serving every VBAN strip
+  on that port. PipeWire ≥ 1.4 creates a stream per incoming session and applies our
+  `stream.rules` (match `sess.name` + optional `vban.ip`, name the node after the
+  strip). Older versions ignore rules and make one stream up front from `stream.props`,
+  which carries the *first* strip's identity — so pre-1.4 it's one stream per port, and
+  the engine warns. `vban_conflict` rejects two strips whose rules would both match one
+  session.
+- Invalid configs are rejected in the engine (`VbanSend/VbanRecv::validated`) and
+  surfaced via `EngineEvent::Error` → `engine_error` → `mixer.notice`.
 
 ### Metering
 

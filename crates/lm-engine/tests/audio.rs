@@ -16,7 +16,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use lm_engine::filterchain::{bus_args, virtual_strip_args, LoadedModule};
+use lm_engine::filterchain::{
+    bus_args, vban_recv_args, vban_send_args, vban_strip_args, virtual_strip_args, LoadedModule, VbanRecvStream,
+};
 use lm_engine::links::LinkManager;
 use lm_engine::meter::{MeterAccum, MeterTap};
 use lm_engine::params;
@@ -53,6 +55,178 @@ struct State {
     nodes: HashMap<String, Node>,
 }
 
+/// Stands in for the session manager the private daemon doesn't have.
+///
+/// Nothing else switches our streams' adapters into DSP mode, so they never
+/// grow per-channel ports and can't be linked. On PipeWire 1.4.x
+/// `adapter.auto-port-config` can't do it either — it derives the format from
+/// the follower's EnumFormat, and filter-chain never puts a rate there — so do
+/// what WirePlumber does: set a complete PortConfig (dsp, F32P/48k/stereo) on
+/// every lm.* node as it appears, before anything links it.
+///
+/// It must be its own client. Setting a param on a node makes the daemon stop
+/// reading the setter's socket until that node has synced; the tone and meter
+/// streams live on the rig's connection, so doing this from the rig's own core
+/// waits on itself forever (the connection just goes silent).
+struct PortConfigurator {
+    _core: CoreRc,
+    _registry: pipewire::registry::RegistryRc,
+    _listener: pipewire::registry::Listener,
+    _configured: Rc<RefCell<HashMap<u32, Configured>>>,
+}
+
+/// A bound lm.* node waiting for (or done with) its PortConfig. The node's
+/// channel layout is only in its full info, not the registry global, so the
+/// config is set from the info event.
+struct Configured {
+    node: Node,
+    _info: Option<pipewire::node::NodeListener>,
+    done: bool,
+}
+
+impl PortConfigurator {
+    /// `None` unless the harness says there is no session manager; against a
+    /// real session WirePlumber already does this and we must keep out of it.
+    fn new(context: &ContextRc) -> Option<Self> {
+        if std::env::var("LM_TEST_NO_SESSION_MANAGER").ok().as_deref() != Some("1") {
+            return None;
+        }
+        let core = context.connect_rc(None).expect("second connection for port config");
+        let registry = core.get_registry_rc().expect("registry");
+        let configured: Rc<RefCell<HashMap<u32, Configured>>> = Rc::default();
+        let listener = {
+            let added = configured.clone();
+            let removed = configured.clone();
+            let registry_weak = registry.downgrade();
+            registry
+                .add_listener_local()
+                .global(move |global| {
+                    if global.type_ != ObjectType::Node {
+                        return;
+                    }
+                    let Some(props) = global.props else { return };
+                    let name = props.get("node.name").unwrap_or("");
+                    let class = props.get("media.class").unwrap_or("");
+                    let wanted = matches!(
+                        class,
+                        "Audio/Sink" | "Audio/Source" | "Stream/Input/Audio" | "Stream/Output/Audio"
+                    );
+                    if !name.starts_with("lm.") || !wanted {
+                        return;
+                    }
+                    let Some(registry) = registry_weak.upgrade() else { return };
+                    let Ok(node) = registry.bind::<Node, _>(global) else { return };
+                    // Keep the node's own channel layout, as WirePlumber does:
+                    // strip outputs carry six channels, effect inputs a
+                    // surround pair, everything else stereo. The layout is in
+                    // the node's info, which arrives as an event.
+                    let id = global.id;
+                    let class = class.to_string();
+                    let map = Rc::downgrade(&added);
+                    let info = node
+                        .add_listener_local()
+                        .info(move |info| {
+                            let Some(map) = map.upgrade() else { return };
+                            let mut map = map.borrow_mut();
+                            let Some(entry) = map.get_mut(&id) else { return };
+                            if entry.done {
+                                return;
+                            }
+                            let positions =
+                                info.props().and_then(|p| p.get("audio.position")).map(parse_positions).unwrap_or_default();
+                            let bytes = dsp_port_config(&class, &positions);
+                            let pod = libspa::pod::Pod::from_bytes(&bytes).expect("valid PortConfig pod");
+                            entry.node.set_param(libspa::param::ParamType::PortConfig, 0, pod);
+                            entry.done = true;
+                        })
+                        .register();
+                    // Keep the proxy until the node goes, so the param isn't
+                    // raced by the proxy's own destruction.
+                    added.borrow_mut().insert(id, Configured { node, _info: Some(info), done: false });
+                })
+                .global_remove(move |id| {
+                    removed.borrow_mut().remove(&id);
+                })
+                .register()
+        };
+        Some(Self { _core: core, _registry: registry, _listener: listener, _configured: configured })
+    }
+}
+
+/// `audio.position` as a node property ("FL,FR,SL,SR" or "[ FL FR ]") to SPA
+/// channel ids. Unknown names make the whole list empty (stereo fallback).
+fn parse_positions(s: &str) -> Vec<u32> {
+    use libspa::sys::*;
+    let ids: Option<Vec<u32>> = s
+        .split(|c: char| c == ',' || c.is_whitespace() || c == '[' || c == ']' || c == '"')
+        .filter(|t| !t.is_empty())
+        .map(|t| match t {
+            "FL" => Some(SPA_AUDIO_CHANNEL_FL),
+            "FR" => Some(SPA_AUDIO_CHANNEL_FR),
+            "FC" => Some(SPA_AUDIO_CHANNEL_FC),
+            "LFE" => Some(SPA_AUDIO_CHANNEL_LFE),
+            "SL" => Some(SPA_AUDIO_CHANNEL_SL),
+            "SR" => Some(SPA_AUDIO_CHANNEL_SR),
+            "RL" => Some(SPA_AUDIO_CHANNEL_RL),
+            "RR" => Some(SPA_AUDIO_CHANNEL_RR),
+            _ => None,
+        })
+        .collect();
+    ids.unwrap_or_default()
+}
+
+fn dsp_port_config(media_class: &str, positions: &[u32]) -> Vec<u8> {
+    use libspa::pod::{Object, Property, PropertyFlags, Value};
+    use libspa::utils::Id;
+
+    // The adapter's direction: sinks and capture streams take input.
+    let direction = if media_class.contains("Sink") || media_class.contains("Input") {
+        libspa::sys::SPA_DIRECTION_INPUT
+    } else {
+        libspa::sys::SPA_DIRECTION_OUTPUT
+    };
+
+    let channels: &[u32] = if positions.is_empty() {
+        &[libspa::sys::SPA_AUDIO_CHANNEL_FL, libspa::sys::SPA_AUDIO_CHANNEL_FR]
+    } else {
+        positions
+    };
+    let mut info = libspa::param::audio::AudioInfoRaw::new();
+    info.set_format(libspa::param::audio::AudioFormat::F32P);
+    info.set_rate(RATE);
+    info.set_channels(channels.len() as u32);
+    let mut position = [0u32; libspa::sys::SPA_AUDIO_MAX_CHANNELS as usize];
+    position[..channels.len()].copy_from_slice(channels);
+    info.set_position(position);
+
+    let prop = |key, value| Property { key, flags: PropertyFlags::empty(), value };
+    let obj = Value::Object(Object {
+        type_: libspa::sys::SPA_TYPE_OBJECT_ParamPortConfig,
+        id: libspa::sys::SPA_PARAM_PortConfig,
+        properties: vec![
+            prop(libspa::sys::SPA_PARAM_PORT_CONFIG_direction, Value::Id(Id(direction))),
+            prop(
+                libspa::sys::SPA_PARAM_PORT_CONFIG_mode,
+                Value::Id(Id(libspa::sys::SPA_PARAM_PORT_CONFIG_MODE_dsp)),
+            ),
+            prop(libspa::sys::SPA_PARAM_PORT_CONFIG_monitor, Value::Bool(false)),
+            prop(libspa::sys::SPA_PARAM_PORT_CONFIG_control, Value::Bool(false)),
+            prop(
+                libspa::sys::SPA_PARAM_PORT_CONFIG_format,
+                Value::Object(Object {
+                    type_: libspa::sys::SPA_TYPE_OBJECT_Format,
+                    id: libspa::sys::SPA_PARAM_Format,
+                    properties: info.into(),
+                }),
+            ),
+        ],
+    });
+    libspa::pod::serialize::PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &obj)
+        .expect("serialize PortConfig")
+        .0
+        .into_inner()
+}
+
 /// A PipeWire client with a graph model, a link reconciler, and whatever
 /// modules/taps/streams a test has created. Everything lives on one main loop.
 struct Rig {
@@ -63,6 +237,7 @@ struct Rig {
     modules: Vec<LoadedModule>,
     taps: Vec<MeterTap>,
     tones: Vec<Tone>,
+    _port_config: Option<PortConfigurator>,
     /// The registry proxy must outlive its listener — dropping it silently
     /// unsubscribes and the graph model stays empty forever.
     _registry: pipewire::registry::RegistryRc,
@@ -141,6 +316,7 @@ impl Rig {
                 .register()
         };
 
+        let port_config = PortConfigurator::new(&context);
         let rig = Self {
             mainloop,
             context,
@@ -149,6 +325,7 @@ impl Rig {
             modules: Vec::new(),
             taps: Vec::new(),
             tones: Vec::new(),
+            _port_config: port_config,
             _registry: registry,
             _reg_listener: reg_listener,
         };
@@ -175,6 +352,11 @@ impl Rig {
     fn load(&mut self, args: &str) {
         let module = LoadedModule::load(&self.context, "libpipewire-module-filter-chain", args)
             .expect("filter-chain module must load (is lsp-plugins-lv2 installed?)");
+        self.modules.push(module);
+    }
+
+    fn load_module(&mut self, name: &str, args: &str) {
+        let module = LoadedModule::load(&self.context, name, args).unwrap_or_else(|e| panic!("{name} must load: {e}"));
         self.modules.push(module);
     }
 
@@ -350,6 +532,8 @@ fn strip(id: u32) -> StripState {
         gate: Default::default(),
         comp: Default::default(),
         eq: Default::default(),
+        pan: Default::default(), sends: Default::default(),
+        vban: None,
     };
     s.gain_db = 0.0;
     s
@@ -364,6 +548,8 @@ fn bus_a1() -> BusState {
         gain_db: 0.0,
         mute: false,
         limiter: LimiterParams::default(),
+        eq: lm_protocol::EqParams::bus_default(),
+        vban: Default::default(),
     }
 }
 
@@ -440,6 +626,43 @@ fn strip_module_appears_and_vanishes() {
     );
 }
 
+/// filter-chain unloads itself when one of its streams loses its node (or its
+/// daemon connection drops). Dropping our handle afterwards must not destroy
+/// the module a second time — that was a use-after-free (heap corruption
+/// aborts in pw_impl_module_destroy).
+#[test]
+#[ignore = "requires a PipeWire daemon; run with `make test-audio`"]
+fn module_that_unloaded_itself_is_not_destroyed_twice() {
+    let mut rig = Rig::new();
+    let s = strip(1);
+
+    rig.load(&virtual_strip_args(&s.node_base(), &s.label, false));
+    rig.settle(400);
+    assert!(rig.modules[0].is_loaded());
+
+    // Kill the strip's output stream node from outside, as `pw-cli destroy`
+    // (or a misbehaving session manager) might.
+    let id = rig
+        .state
+        .borrow()
+        .model
+        .node_by_name(&s.out_node())
+        .expect("strip output node exists")
+        .id;
+    rig._registry.destroy_global(id).into_result().expect("destroy strip output node");
+    rig.settle(400);
+
+    assert!(!rig.modules[0].is_loaded(), "filter-chain should have unloaded itself");
+    assert_eq!(
+        rig.node_names_starting_with("lm."),
+        Vec::<String>::new(),
+        "a self-unloaded module must still leave zero lm.* nodes behind"
+    );
+
+    rig.modules.clear(); // must be a no-op now, not a second destroy
+    rig.settle(100);
+}
+
 /// B buses are the virtual microphones other apps select.
 #[test]
 #[ignore = "requires a PipeWire daemon; run with `make test-audio`"]
@@ -453,6 +676,8 @@ fn b_bus_appears_as_a_microphone() {
         gain_db: 0.0,
         mute: false,
         limiter: LimiterParams::default(),
+        eq: lm_protocol::EqParams::bus_default(),
+        vban: Default::default(),
     };
 
     rig.load(&bus_args(&b.node_base(), &b.label, None));
@@ -538,6 +763,148 @@ fn strip_gain_moves_the_metered_level_by_the_requested_db() {
     );
 }
 
+/// The stereo-image stage is real DSP: balance hard left must silence the right
+/// output channel and leave the left untouched, through the same Props keys
+/// the engine writes.
+#[test]
+#[ignore = "requires a PipeWire daemon; run with `make test-audio`"]
+fn balance_hard_left_silences_the_right_channel() {
+    let (rig, strip_meter, _bus_meter, s, _b) = full_chain(0.5);
+
+    let [l0, r0, ..] = rig.measure(&strip_meter, 500);
+    assert!(l0 > -20.0 && (l0 - r0).abs() < 1.0, "centred tone should read equal L/R ({l0:.1}/{r0:.1})");
+
+    let m = lm_protocol::PanParams { balance: -1.0, ..Default::default() }.matrix();
+    rig.set_props(
+        &s.control_node(),
+        &params::filter_params(&[
+            ("panl:Gain 1", m[0][0]),
+            ("panl:Gain 2", m[0][1]),
+            ("panr:Gain 1", m[1][0]),
+            ("panr:Gain 2", m[1][1]),
+        ]),
+    );
+    rig.settle(300);
+    let [l1, r1, ..] = rig.measure(&strip_meter, 500);
+    assert!((l1 - l0).abs() < 1.0, "left must be unchanged ({l0:.1} -> {l1:.1})");
+    assert!(r1 < -60.0, "right must be silent, got {r1:.1} dBFS");
+
+    // Mono of a centred tone is the same tone on both sides at the same level.
+    let m = lm_protocol::PanParams { mono: true, ..Default::default() }.matrix();
+    rig.set_props(
+        &s.control_node(),
+        &params::filter_params(&[
+            ("panl:Gain 1", m[0][0]),
+            ("panl:Gain 2", m[0][1]),
+            ("panr:Gain 1", m[1][0]),
+            ("panr:Gain 2", m[1][1]),
+        ]),
+    );
+    rig.settle(300);
+    let [l2, r2, ..] = rig.measure(&strip_meter, 500);
+    assert!((l2 - l0).abs() < 1.0 && (r2 - r0).abs() < 1.0, "mono of identical channels is unity ({l2:.1}/{r2:.1})");
+}
+
+/// The bus EQ sits in the bus's own filter-chain, ahead of the limiter: a
+/// +6 dB bell at the tone's frequency must raise the bus output by 6 dB while
+/// the strip feeding it is unchanged.
+#[test]
+#[ignore = "requires a PipeWire daemon; run with `make test-audio`"]
+fn bus_eq_boost_raises_the_bus_level() {
+    // -12 dBFS peak leaves room for the boost.
+    let (rig, strip_meter, bus_meter, _s, b) = full_chain(0.25);
+
+    let strip_before = rig.measure(&strip_meter, 500)[0];
+    let before = rig.measure(&bus_meter, 500)[0];
+    assert!(before > -20.0, "no signal on the bus (peak {before:.1} dBFS)");
+
+    rig.set_props(
+        &b.in_node(),
+        &params::filter_params(&[
+            ("eq:enabled", 1.0),
+            ("eq:ft_3", lm_protocol::EqBandKind::Peak.lsp_filter_type()),
+            ("eq:f_3", 1000.0),
+            ("eq:g_3", params::db_to_linear(6.0)),
+            ("eq:q_3", 1.0),
+        ]),
+    );
+    rig.settle(400);
+
+    let after = rig.measure(&bus_meter, 500)[0];
+    let strip_after = rig.measure(&strip_meter, 500)[0];
+    assert!((after - before - 6.0).abs() < 1.5, "bus moved {:.2} dB, wanted +6 ({before:.1} -> {after:.1})", after - before);
+    assert!((strip_after - strip_before).abs() < 1.0, "the strip must be unaffected ({strip_before:.1} -> {strip_after:.1})");
+}
+
+/// Echo and reverb are fed by the strips' send channels (surround pairs matched by
+/// the router): with a send at zero the effect's return is silent; turned
+/// up, the effect produces sound. Uses the engine's Props keys.
+#[test]
+#[ignore = "requires a PipeWire daemon; run with `make test-audio`"]
+fn sends_feed_echo_and_reverb() {
+    use lm_protocol::{FxKind, FxState};
+    let mut rig = Rig::new();
+    let s = strip(1);
+    rig.want_control(&s.control_node());
+    rig.want_control(&FxKind::Echo.in_node());
+    rig.want_control(&FxKind::Reverb.in_node());
+    rig.load(&virtual_strip_args(&s.node_base(), &s.label, false));
+    rig.load(&lm_engine::filterchain::echo_args());
+    let ir = lm_engine::fx::write_reverb_ir(800.0, 0.5).expect("write impulse response");
+    rig.load(&lm_engine::filterchain::reverb_args(&ir.to_string_lossy()));
+    rig.settle(500);
+
+    rig.tone("lm.test.tone", 1000.0, 0.5);
+    rig.settle(200);
+    rig.route("lm.test.tone", &s.node_base(), true);
+    rig.route(&s.out_node(), SINK, true);
+    for k in FxKind::ALL {
+        rig.route(&s.out_node(), &k.in_node(), true);
+        // A real consumer, as a bus would be; meter taps alone are passive.
+        rig.route(&k.out_node(), SINK, true);
+    }
+    let echo_meter = rig.tap("test-echo", &FxKind::Echo.out_node());
+    let reverb_meter = rig.tap("test-reverb", &FxKind::Reverb.out_node());
+    rig.settle(500);
+    make_transparent(&rig, &s.control_node());
+
+    // Echo times and repeat levels as the engine sets them.
+    let echo = FxState::default_for(FxKind::Echo);
+    let mut pairs: Vec<(String, f32)> = Vec::new();
+    for side in ['l', 'r'] {
+        for (i, g) in echo.echo_tap_gains().iter().enumerate() {
+            pairs.push((format!("d{side}{}:Delay (s)", i + 1), echo.time_ms / 1000.0 * (i + 1) as f32));
+            pairs.push((format!("m{side}:Gain {}", i + 1), *g));
+        }
+    }
+    let borrowed: Vec<(&str, f32)> = pairs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    rig.set_props(&FxKind::Echo.in_node(), &params::filter_params(&borrowed));
+    for k in FxKind::ALL {
+        rig.set_props(&k.in_node(), &params::channel_volumes(1.0));
+    }
+    rig.settle(1500); // longer than the last echo tap
+
+    let quiet_echo = rig.measure(&echo_meter, 500)[0];
+    let quiet_reverb = rig.measure(&reverb_meter, 500)[0];
+    assert!(quiet_echo < -60.0, "echo must be silent with its send at zero ({quiet_echo:.1})");
+    assert!(quiet_reverb < -60.0, "reverb must be silent with its send at zero ({quiet_reverb:.1})");
+
+    let sends = |rv: f32, ec: f32| {
+        params::filter_params(&[("rvl:Gain 1", rv), ("rvr:Gain 1", rv), ("ecl:Gain 1", ec), ("ecr:Gain 1", ec)])
+    };
+    rig.set_props(&s.control_node(), &sends(0.0, 1.0));
+    rig.settle(1600);
+    let [el, er, ..] = rig.measure(&echo_meter, 500);
+    let reverb_still = rig.measure(&reverb_meter, 300)[0];
+    assert!(el > -30.0 && er > -30.0, "echo send produced no echo ({el:.1}/{er:.1})");
+    assert!(reverb_still < -60.0, "the echo send must not reach the reverb ({reverb_still:.1})");
+
+    rig.set_props(&s.control_node(), &sends(1.0, 0.0));
+    rig.settle(1200);
+    let [rl, rr, ..] = rig.measure(&reverb_meter, 500);
+    assert!(rl > -40.0 && rr > -40.0, "reverb send produced no reverb ({rl:.1}/{rr:.1})");
+}
+
 /// Mute must actually silence the audio, not just grey out a button.
 #[test]
 #[ignore = "requires a PipeWire daemon; run with `make test-audio`"]
@@ -593,4 +960,137 @@ fn gate_threshold_opens_and_closes_the_signal() {
         "gate made little difference: closed {closed:.1} dBFS vs open {open:.1} dBFS"
     );
     assert!(open > -20.0, "gate never reopened (peak {open} dBFS)");
+}
+
+/// The VBAN transport alone, with no filter-chain in the path: tone ->
+/// vban-send -> 127.0.0.1 -> vban-recv -> meter. Isolates the network modules
+/// and our args for them (stream naming, rules, port) from the LSP DSP.
+#[test]
+#[ignore = "requires a PipeWire daemon; run with `make test-audio`"]
+fn vban_send_and_recv_round_trip_a_tone() {
+    const PORT: u16 = 6991;
+    let mut rig = Rig::new();
+    let send = lm_protocol::VbanSend {
+        enabled: true,
+        stream_name: "lmraw".into(),
+        host: "127.0.0.1".into(),
+        port: PORT,
+        rate: RATE,
+    };
+    let recv = VbanRecvStream {
+        node_name: "lm.test.vban-recv".into(),
+        label: "Raw".into(),
+        stream_name: "lmraw".into(),
+        sender_ip: String::new(),
+        latency_ms: 50,
+    };
+    // A second rule on the same port for a session nobody sends: it must not
+    // produce a node (and must not steal "lmraw").
+    let decoy = VbanRecvStream {
+        node_name: "lm.test.vban-decoy".into(),
+        label: "Decoy".into(),
+        stream_name: "nobody".into(),
+        sender_ip: String::new(),
+        latency_ms: 50,
+    };
+
+    rig.load_module("libpipewire-module-vban-recv", &vban_recv_args(PORT, &[recv.clone(), decoy]));
+    rig.load_module("libpipewire-module-vban-send", &vban_send_args("lm.test.vban-send", "Test", &send));
+    rig.settle(400);
+    assert!(rig.node_exists("lm.test.vban-send"), "sender stream did not appear");
+
+    rig.tone("lm.test.tone", 1000.0, 0.5);
+    rig.settle(200);
+    rig.route("lm.test.tone", "lm.test.vban-send", true);
+    // Meter taps are passive and do not make a node run; give the received
+    // stream a real consumer, as a VBAN strip's input is in the app.
+    rig.route(&recv.node_name, SINK, true);
+    let meter = rig.tap("test-vban-raw", &recv.node_name);
+    rig.settle(1500);
+
+    assert!(rig.node_exists(&recv.node_name), "receiver stream {} never appeared", recv.node_name);
+    if lm_engine::filterchain::vban_recv_has_rules(&pipewire_version()) {
+        assert!(!rig.node_exists("lm.test.vban-decoy"), "a rule for an absent session created a node");
+    }
+    let [peak, _, rms, _] = rig.measure(&meter, 600);
+    assert!((peak - -6.02).abs() < 2.0, "received peak {peak:.2} dBFS, expected about -6");
+    assert!((rms - -9.03).abs() < 2.0, "received rms {rms:.2} dBFS, expected about -9");
+
+    rig.modules.clear();
+    rig.settle(400);
+    assert!(rig.node_names_starting_with("lm.test.vban").is_empty(), "VBAN nodes must vanish with their modules");
+}
+
+fn pipewire_version() -> String {
+    // SAFETY: static NUL-terminated string.
+    unsafe { std::ffi::CStr::from_ptr(pipewire::sys::pw_get_library_version()) }.to_string_lossy().into_owned()
+}
+
+/// VBAN end to end over loopback UDP, using exactly the module args the
+/// engine builds: tone -> vban-send -> 127.0.0.1 -> vban-recv -> VBAN strip
+/// (gate/comp/EQ) -> meter. The receiver stream must carry the name the
+/// strip's route expects, on old (stream.props) and new (stream.rules)
+/// PipeWire alike, and the level must survive the S16 round trip.
+#[test]
+#[ignore = "requires a PipeWire daemon; run with `make test-audio`"]
+fn vban_loopback_reaches_a_vban_strip() {
+    const PORT: u16 = 6990; // not the default, to stay off any real VBAN traffic
+    let mut rig = Rig::new();
+    let mut s = strip(5);
+    s.kind = StripKind::Vban;
+    s.vban = Some(lm_protocol::VbanRecv { stream_name: "lmtest".into(), port: PORT, ..Default::default() });
+    let send = lm_protocol::VbanSend {
+        enabled: true,
+        stream_name: "lmtest".into(),
+        host: "127.0.0.1".into(),
+        port: PORT,
+        rate: RATE,
+    };
+
+    rig.want_control(&s.control_node());
+    rig.load(&vban_strip_args(&s.node_base(), &s.label));
+    rig.load_module(
+        "libpipewire-module-vban-recv",
+        &vban_recv_args(
+            PORT,
+            &[VbanRecvStream {
+                node_name: s.vban_node(),
+                label: s.label.clone(),
+                stream_name: "lmtest".into(),
+                sender_ip: String::new(),
+                latency_ms: 50,
+            }],
+        ),
+    );
+    rig.load_module("libpipewire-module-vban-send", &vban_send_args("lm.test.vban-send", "Test", &send));
+    rig.settle(400);
+
+    rig.tone("lm.test.tone", 1000.0, 0.5);
+    rig.settle(200);
+    rig.route("lm.test.tone", "lm.test.vban-send", true);
+    // The receiver stream may only appear once packets arrive (PipeWire >= 1.4);
+    // the route is by name, so it links whenever that happens.
+    rig.route(&s.vban_node(), &s.node_base(), true);
+    // Meter taps are passive; the strip output needs a real consumer to run,
+    // as it has in the app (a bus).
+    rig.route(&s.out_node(), SINK, true);
+    let meter = rig.tap("test-vban", &s.out_node());
+    rig.settle(1500);
+    make_transparent(&rig, &s.control_node());
+    rig.settle(300);
+
+    assert!(rig.node_exists(&s.vban_node()), "receiver stream {} never appeared", s.vban_node());
+    let [peak, _, rms, _] = rig.measure(&meter, 600);
+    assert!(
+        (peak - -6.02).abs() < 2.0,
+        "VBAN strip peak {peak:.2} dBFS, expected about -6; did packets make it through?"
+    );
+    assert!((rms - -9.03).abs() < 2.0, "VBAN strip rms {rms:.2} dBFS, expected about -9");
+
+    rig.modules.clear();
+    rig.settle(400);
+    assert!(
+        rig.node_names_starting_with("lm.strip").is_empty(),
+        "unloading must leave no VBAN or strip nodes behind"
+    );
 }

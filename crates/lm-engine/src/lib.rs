@@ -6,6 +6,7 @@
 
 pub mod engine;
 pub mod filterchain;
+pub mod fx;
 pub mod links;
 pub mod meter;
 pub mod params;

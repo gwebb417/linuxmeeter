@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { ipc } from "../lib/ipc";
   import { mixer } from "../lib/state/mixer.svelte";
+  import { ui } from "../lib/state/ui.svelte";
   import { startDragging } from "../lib/window";
   import WindowControls from "./WindowControls.svelte";
 
@@ -9,6 +10,10 @@
   onMount(async () => {
     autostart = await ipc.getAutostart();
   });
+  let vbanActive = $derived(mixer.buses.some((b) => b.vban.enabled) || mixer.strips.some((s) => s.kind === "vban"));
+  // Lit while any strip sends to an effect.
+  let fxActive = $derived(mixer.strips.some((s) => s.sends.reverb > 0 || s.sends.echo > 0));
+
   function toggleAutostart() {
     autostart = !autostart;
     void ipc.setAutostart(autostart);
@@ -51,6 +56,31 @@
       onclick={toggleAutostart}
     >
       AUTOSTART
+    </button>
+    <button
+      class="toggle"
+      class:active={vbanActive}
+      title="VBAN network audio: send buses to, and receive streams from, VoiceMeeter and other VBAN devices"
+      onclick={() => (ui.vbanOpen = true)}
+    >
+      VBAN
+    </button>
+    <button
+      class="toggle"
+      class:active={fxActive}
+      title="Effects: reverb and echo returns, their settings and which buses they feed"
+      onclick={() => (ui.fxOpen = true)}
+    >
+      FX
+    </button>
+    <button
+      class="toggle"
+      class:active={ui.macroBar}
+      aria-pressed={ui.macroBar}
+      title="Show or hide the macro buttons"
+      onclick={() => (ui.macroBar = !ui.macroBar)}
+    >
+      MACROS
     </button>
   </div>
   <button class="iconbtn" title="Settings">

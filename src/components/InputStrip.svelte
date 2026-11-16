@@ -11,6 +11,7 @@
   import RoutingToggleGroup from "./RoutingToggleGroup.svelte";
   import MuteSoloButtons from "./MuteSoloButtons.svelte";
   import ColorPad from "./ColorPad.svelte";
+  import PanRow from "./PanRow.svelte";
 
   interface Props {
     strip: StripState;
@@ -25,7 +26,9 @@
   let deviceDisplay = $derived(
     strip.kind === "hardware"
       ? (mixer.devices.find((d) => d.nodeName === strip.hwKey)?.description ?? strip.hwKey ?? "—")
-      : `lm.strip.${strip.id}`,
+      : strip.kind === "vban" && strip.vban
+        ? `${strip.vban.streamName} :${strip.vban.port}`
+        : `lm.strip.${strip.id}`,
   );
 </script>
 
@@ -35,8 +38,10 @@
     deviceValue={strip.hwKey}
     {deviceDisplay}
     {deviceOptions}
-    deviceDisabled={strip.kind === "virtual"}
+    deviceDisabled={strip.kind !== "hardware"}
     ondevicechange={(v) => mixer.setStripDevice(strip.id, v)}
+    onrename={(label) => mixer.setLabel({ strip: strip.id }, label)}
+    onremove={() => mixer.removeStrip(strip.id)}
   />
 
   <div class="mf">
@@ -79,7 +84,10 @@
         class:active={strip.eq.enabled}
         aria-pressed={strip.eq.enabled}
         title="Open equalizer"
-        onclick={() => (ui.eqStrip = strip.id)}
+        onclick={() => {
+          ui.eqBus = null;
+          ui.eqStrip = strip.id;
+        }}
       >
         EQ
       </button>
@@ -96,9 +104,34 @@
   </div>
 
   <ColorPad {strip} />
+  <PanRow pan={strip.pan} onchange={(p) => mixer.setPanParams(strip.id, p)} />
+  <div class="sends" role="group" aria-label="Effect sends">
+    <Knob
+      label="REVERB"
+      min={0}
+      max={1}
+      value={strip.sends.reverb}
+      defaultValue={0}
+      fmt={(v) => `${Math.round(v * 100)}%`}
+      onchange={(v) => mixer.setSends(strip.id, { ...strip.sends, reverb: Math.round(v * 100) / 100 })}
+    />
+    <Knob
+      label="ECHO"
+      min={0}
+      max={1}
+      value={strip.sends.echo}
+      defaultValue={0}
+      fmt={(v) => `${Math.round(v * 100)}%`}
+      onchange={(v) => mixer.setSends(strip.id, { ...strip.sends, echo: Math.round(v * 100) / 100 })}
+    />
+  </div>
 
   <div class="sep"></div>
-  <RoutingToggleGroup routes={strip.routes} ontoggle={(bus, on) => mixer.setRoute(strip.id, bus, on)} />
+  <RoutingToggleGroup
+    buses={mixer.buses.map((b) => b.id)}
+    routes={strip.routes}
+    ontoggle={(bus, on) => mixer.setRoute(strip.id, bus, on)}
+  />
 
   <MuteSoloButtons
     mute={strip.mute}
@@ -143,6 +176,10 @@
     justify-content: space-between;
     align-items: flex-start;
     padding: 0 2px;
+  }
+  .sends {
+    display: flex;
+    justify-content: space-around;
   }
   .panelbtns {
     display: flex;

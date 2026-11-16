@@ -16,14 +16,39 @@ use pipewire::stream::{StreamFlags, StreamListener, StreamRc};
 
 const SILENT_DB: f32 = -90.0;
 
+/// How many drains in a row may repeat the last reading when no audio was
+/// processed at all in between. A tap's process callback runs once per graph
+/// cycle, and not every graph runs on a steady clock faster than the 30 Hz
+/// drain: on PipeWire 1.6 a VBAN receive stream drives its own graph when the
+/// strip isn't routed to hardware, and cycles as packets arrive. Without a
+/// hold, every drain that falls between two cycles would read as silence and
+/// the meter would flicker. Three drains (~100 ms) covers that and still lets
+/// a stream that has really stopped fall to the floor promptly.
+const MAX_HOLD_DRAINS: u32 = 3;
+
 /// Lock-free accumulator shared between the process callback and the drain timer.
-#[derive(Default)]
 pub struct MeterAccum {
     /// Bit-cast f32 peak per channel (reset to 0.0 on drain).
     peak: [AtomicU32; 2],
     /// Sum of squares per channel, f64 bits (f64 loses no precision at meter timescales).
     sum_sq: [AtomicU64; 2],
     samples: [AtomicU64; 2],
+    /// Last frame returned by `drain`, bit-cast f32s. Only `drain` touches these.
+    last: [AtomicU32; 4],
+    /// Consecutive drains that found no processed samples.
+    idle_drains: AtomicU32,
+}
+
+impl Default for MeterAccum {
+    fn default() -> Self {
+        Self {
+            peak: Default::default(),
+            sum_sq: Default::default(),
+            samples: Default::default(),
+            last: std::array::from_fn(|_| AtomicU32::new(SILENT_DB.to_bits())),
+            idle_drains: AtomicU32::new(0),
+        }
+    }
 }
 
 impl MeterAccum {
@@ -39,14 +64,32 @@ impl MeterAccum {
     }
 
     /// Read-and-reset; returns [peak_l, peak_r, rms_l, rms_r] in dBFS.
+    ///
+    /// A drain that finds no processed samples (as opposed to silent ones)
+    /// repeats the previous reading for up to [`MAX_HOLD_DRAINS`] drains; see
+    /// there for why.
     pub fn drain(&self) -> [f32; 4] {
         let mut out = [SILENT_DB; 4];
+        let mut processed = 0u64;
         for ch in 0..2 {
             let peak = f32::from_bits(self.peak[ch].swap(0, Ordering::Relaxed));
             let sum_sq = f64::from_bits(self.sum_sq[ch].swap(0, Ordering::Relaxed));
             let n = self.samples[ch].swap(0, Ordering::Relaxed);
+            processed += n;
             out[ch] = amp_to_db(peak);
             out[2 + ch] = if n > 0 { amp_to_db((sum_sq / n as f64).sqrt() as f32) } else { SILENT_DB };
+        }
+        if processed == 0 {
+            let idle = self.idle_drains.load(Ordering::Relaxed).saturating_add(1);
+            self.idle_drains.store(idle, Ordering::Relaxed);
+            if idle <= MAX_HOLD_DRAINS {
+                return self.last.each_ref().map(|v| f32::from_bits(v.load(Ordering::Relaxed)));
+            }
+        } else {
+            self.idle_drains.store(0, Ordering::Relaxed);
+        }
+        for (slot, v) in self.last.iter().zip(out) {
+            slot.store(v.to_bits(), Ordering::Relaxed);
         }
         out
     }
@@ -249,13 +292,50 @@ mod tests {
     }
 
     /// The 30 Hz drain must reset, or a single transient would latch the meter
-    /// at its peak forever.
+    /// at its peak forever: processed silence reads as silence immediately.
     #[test]
     fn drain_resets_the_accumulator() {
         let accum = MeterAccum::default();
         feed(&accum, 0, &[1.0]);
+        feed(&accum, 1, &[1.0]);
         assert!(accum.drain()[0].abs() < 0.01);
-        assert_eq!(accum.drain(), [SILENT_DB; 4], "second drain must be silent");
+        feed(&accum, 0, &[0.0]);
+        feed(&accum, 1, &[0.0]);
+        assert_eq!(accum.drain(), [SILENT_DB; 4], "a silent cycle must read silent at once");
+    }
+
+    /// A drain that lands between two graph cycles has seen no samples at all.
+    /// That is "no news", not silence: it repeats the last reading, so a graph
+    /// that cycles slower than the drain doesn't make the meter flicker.
+    #[test]
+    fn a_drain_with_no_cycles_holds_the_last_reading() {
+        let accum = MeterAccum::default();
+        feed(&accum, 0, &sine(0.5, 10, 64));
+        feed(&accum, 1, &sine(0.5, 10, 64));
+        let first = accum.drain();
+        assert!((first[0] - -6.02).abs() < 0.1);
+        assert_eq!(accum.drain(), first, "no cycle since the last drain: hold");
+        feed(&accum, 0, &sine(0.5, 10, 64));
+        feed(&accum, 1, &sine(0.5, 10, 64));
+        assert!((accum.drain()[0] - -6.02).abs() < 0.1, "fresh samples are read normally");
+    }
+
+    /// The hold is bounded: a stream that has really stopped falls to the floor
+    /// after MAX_HOLD_DRAINS empty drains instead of latching forever.
+    #[test]
+    fn the_hold_expires_when_a_stream_stops() {
+        let accum = MeterAccum::default();
+        feed(&accum, 0, &[1.0]);
+        feed(&accum, 1, &[1.0]);
+        let live = accum.drain();
+        for i in 0..MAX_HOLD_DRAINS {
+            assert_eq!(accum.drain(), live, "empty drain {} still holds", i + 1);
+        }
+        assert_eq!(accum.drain(), [SILENT_DB; 4], "then it falls to the floor");
+        assert_eq!(accum.drain(), [SILENT_DB; 4], "and stays there");
+        feed(&accum, 0, &[1.0]);
+        feed(&accum, 1, &[1.0]);
+        assert!(accum.drain()[0].abs() < 0.01, "and recovers as soon as audio returns");
     }
 
     /// Several process callbacks land between drains; peak is a max over all

@@ -21,10 +21,33 @@ OBS, or any recorder can use.
 
   ![Dynamics panel](docs/screenshot-dyn.png)
 
-- **Output buses** — A1/A2 to hardware devices, B1/B2 as **virtual
-  microphones** (post-limiter) selectable in any app
-- **Routing matrix** — A1/A2/B1/B2 toggles per strip, applied as live
+- **Stereo image per strip** — VoiceMeeter-style **MONO** and **⇄**
+  (swap left/right) buttons plus a balance slider, applied after the EQ
+- **Reverb and echo** — **REVERB** / **ECHO** send knobs on every strip
+  feed two shared effects; the **FX** panel sets each return's level, mute,
+  which buses it feeds, reverb decay and damping, and echo time and feedback.
+  Both run on PipeWire's built-in filters (the reverb's impulse response is
+  generated on the fly), so no extra plugins are needed
+- **Macro buttons** — a bar of pads (**MACROS** in the top bar) that each
+  run a list of actions: mute, solo, route, set a fader, mute an effect
+  return, start/stop a VBAN output, or toggle Default out. **Toggle** pads
+  switch between an on and an off list; **Push** pads run one while held
+  and the other on release (push-to-talk). Each pad can have a keyboard
+  shortcut that works while the window has focus
+- **Output buses** — up to five A buses (A1–A5) to hardware devices and
+  three B buses (B1–B3) as **virtual microphones** (post-limiter) selectable
+  in any app; add them with **+A** / **+B**. Every bus has an 8-band
+  parametric **EQ** ahead of its limiter
+- **Your own layout** — add hardware or virtual strips with **+**, remove
+  any strip or bus (hover its name, click ✕ twice), double-click a name to
+  rename it
+- **Routing matrix** — one toggle per bus on every strip, applied as live
   PipeWire links; mute/solo; peak/RMS metering with clip latch at 30 fps
+- **VBAN network audio** — send any bus's post-limiter mix to
+  VoiceMeeter (or any VBAN receiver) on another machine, and receive
+  VBAN streams as their own input strips with full DSP and routing. Built
+  on PipeWire's native `vban-send` / `vban-recv` modules; configure it from
+  the **VBAN** button in the top bar
 - **Default-output takeover** — one click makes the System strip your
   default sink so *all* desktop audio flows through the mixer
 - **Profiles** — everything persists to `~/.config/linuxmeeter/` (TOML,

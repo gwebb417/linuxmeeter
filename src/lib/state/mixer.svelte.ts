@@ -4,7 +4,24 @@
  * backend. Continuous controls (fader drags) throttle IPC to one call per
  * animation frame, with a guaranteed final send.
  */
-import type { AppState, BusId, BusState, CompParams, DeviceInfo, EqParams, GateParams, LimiterParams, StripState } from "../types";
+import type {
+  AppState,
+  BusId,
+  BusState,
+  CompParams,
+  DeviceInfo,
+  EqParams,
+  FxKind,
+  FxSends,
+  FxState,
+  GateParams,
+  LimiterParams,
+  MacroButton,
+  PanParams,
+  StripState,
+  VbanRecv,
+  VbanSend,
+} from "../types";
 import { ipc, type Target } from "../ipc";
 import { ingestFrame } from "./meters";
 
@@ -14,8 +31,13 @@ class MixerStore {
   devices = $state<DeviceInfo[]>([]);
   profileName = $state("Default");
   takeDefaultOutput = $state(false);
+  fx = $state<FxState[]>([]);
+  macros = $state<MacroButton[]>([]);
   ready = $state(false);
   error = $state<string | null>(null);
+  /** Last rejected command from the engine (shown briefly, then cleared). */
+  notice = $state<string | null>(null);
+  #noticeTimer: ReturnType<typeof setTimeout> | undefined;
 
   anySolo = $derived(this.strips.some((s) => s.solo));
 
@@ -46,6 +68,13 @@ class MixerStore {
       ),
     );
     ipc.onStateChanged((state) => this.#apply(state, true));
+    ipc.onError((message) => this.showNotice(message));
+  }
+
+  showNotice(message: string): void {
+    this.notice = message;
+    clearTimeout(this.#noticeTimer);
+    this.#noticeTimer = setTimeout(() => (this.notice = null), 6000);
   }
 
   #apply(s: AppState, guardDragging = false): void {
@@ -70,6 +99,8 @@ class MixerStore {
     this.devices = s.devices;
     this.profileName = s.profileName;
     this.takeDefaultOutput = s.takeDefaultOutput;
+    this.fx = s.fx ?? [];
+    this.macros = s.macros ?? [];
   }
 
   #find(t: Target): StripState | BusState | undefined {
@@ -145,6 +176,47 @@ class MixerStore {
     void ipc.setEqParams(stripId, params);
   }
 
+  setPanParams(stripId: number, params: PanParams): void {
+    const s = this.strip(stripId);
+    if (s) s.pan = params;
+    void ipc.setPanParams(stripId, params);
+  }
+
+  /** Not optimistic: the engine normalizes the list and sends it back. */
+  setMacros(macros: MacroButton[]): void {
+    void ipc.setMacros(macros);
+  }
+
+  /** The engine decides what a press does (toggle vs push) and resends state. */
+  triggerMacro(id: number, pressed: boolean): void {
+    void ipc.triggerMacro(id, pressed);
+  }
+
+  setSends(stripId: number, sends: FxSends): void {
+    const s = this.strip(stripId);
+    if (s) s.sends = sends;
+    void ipc.setSends(stripId, sends);
+  }
+
+  /** Optimistic; the engine clamps out-of-range values and resends state. */
+  setFx(fx: FxState): void {
+    const i = this.fx.findIndex((f) => f.kind === fx.kind);
+    if (i >= 0) this.fx[i] = { ...fx, routes: this.fx[i]!.routes };
+    void ipc.setFx(fx);
+  }
+
+  setFxRoute(kind: FxKind, bus: BusId, on: boolean): void {
+    const f = this.fx.find((x) => x.kind === kind);
+    if (f) f.routes[bus] = on;
+    void ipc.setFxRoute(kind, bus, on);
+  }
+
+  setBusEqParams(bus: BusId, params: EqParams): void {
+    const b = this.bus(bus);
+    if (b) b.eq = params;
+    void ipc.setBusEqParams(bus, params);
+  }
+
   setLimiterParams(bus: BusId, params: LimiterParams): void {
     const b = this.bus(bus);
     if (b) b.limiter = params;
@@ -161,6 +233,53 @@ class MixerStore {
     const b = this.bus(bus);
     if (b) b.targetHwKey = hwKey;
     void ipc.setBusTarget(bus, hwKey);
+  }
+
+  /** Optimistic; an invalid config is rejected by the engine, which resends state. */
+  setBusVban(bus: BusId, config: VbanSend): void {
+    const b = this.bus(bus);
+    if (b) b.vban = config;
+    void ipc.setBusVban(bus, config);
+  }
+
+  /** Not optimistic: the engine assigns the id, and the strip arrives with the next state. */
+  addVbanStrip(label: string, config: VbanRecv): void {
+    void ipc.addVbanStrip(label, config);
+  }
+
+  setStripVban(stripId: number, label: string, config: VbanRecv): void {
+    const s = this.strip(stripId);
+    if (s) {
+      if (label.trim()) s.label = label.trim();
+      s.vban = config;
+    }
+    void ipc.setStripVban(stripId, label, config);
+  }
+
+  /** Not optimistic either: meter frames are index-aligned with the engine's
+   *  strip and bus lists, so the local lists only change when the engine's do. */
+  removeStrip(stripId: number): void {
+    void ipc.removeStrip(stripId);
+  }
+
+  addStrip(kind: "hardware" | "virtual", label = ""): void {
+    void ipc.addStrip(kind, label);
+  }
+
+  addBus(output: boolean): void {
+    void ipc.addBus(output);
+  }
+
+  removeBus(bus: BusId): void {
+    void ipc.removeBus(bus);
+  }
+
+  /** Optimistic; an empty label is rejected by the engine, which resends state. */
+  setLabel(target: Target, label: string): void {
+    const o = this.#find(target);
+    const clean = label.trim();
+    if (o && clean) o.label = clean;
+    void ipc.setLabel(target, label);
   }
 
   setDefaultOutput(on: boolean): void {

@@ -1,19 +1,25 @@
 <script lang="ts">
-  import { BUS_IDS, type BusId } from "../lib/types";
+  import type { BusId } from "../lib/types";
 
   interface Props {
-    routes: Record<BusId, boolean>;
+    /** The buses that exist, in display order. */
+    buses: BusId[];
+    routes: Partial<Record<BusId, boolean>>;
     ontoggle: (bus: BusId, on: boolean) => void;
   }
-  let { routes, ontoggle }: Props = $props();
+  let { buses, routes, ontoggle }: Props = $props();
+
+  // Two per row for the classic four-bus layout; four per row once the
+  // mixer grows toward Potato's eight, so the grid never gets taller than two rows.
+  let cols = $derived(buses.length <= 4 ? 2 : 4);
 </script>
 
-<div class="routes">
-  {#each BUS_IDS as bus}
+<div class="routes" style:grid-template-columns={`repeat(${cols}, 1fr)`}>
+  {#each buses as bus (bus)}
     <button
       class="rbtn"
-      class:active={routes[bus]}
-      aria-pressed={routes[bus]}
+      class:active={!!routes[bus]}
+      aria-pressed={!!routes[bus]}
       onclick={() => ontoggle(bus, !routes[bus])}
     >
       {bus}
@@ -24,11 +30,12 @@
 <style>
   .routes {
     display: grid;
-    grid-template-columns: 1fr 1fr;
     gap: 4px;
   }
   .rbtn {
     height: 22px;
+    min-width: 0;
+    padding: 0;
     font: 500 10px var(--mono);
     letter-spacing: 0.06em;
     background: var(--bg-3);

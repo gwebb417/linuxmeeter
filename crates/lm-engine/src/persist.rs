@@ -92,6 +92,13 @@ fn sanitize(p: &mut Profile) {
     }
     for b in &mut p.buses {
         b.online = true;
+        // A hand-edited bus EQ with too few bands is topped up with the
+        // defaults for the missing slots (the plugin always has eight).
+        let defaults = lm_protocol::EqParams::bus_default().bands;
+        while b.eq.bands.len() < defaults.len() {
+            b.eq.bands.push(defaults[b.eq.bands.len()]);
+        }
+        b.eq.bands.truncate(defaults.len());
     }
     // Buses display (and meter) in A1..A5, B1..B3 order; a hand-edited
     // profile may list them in any order, or twice.
@@ -152,6 +159,7 @@ mod tests {
                 gain_db: 0.0,
                 mute: false,
                 limiter: LimiterParams::default(),
+                eq: EqParams::bus_default(),
                 vban: Default::default(),
             }],
         }
@@ -344,6 +352,18 @@ releaseMs = 50.0
         let ids: Vec<BusId> = p.buses.iter().map(|b| b.id).collect();
         assert_eq!(ids, [BusId::A1, BusId::A4, BusId::B1, BusId::B3]);
         assert_eq!(p.strips.len(), 1, "a duplicate strip id would fight over one node name");
+    }
+
+    #[test]
+    fn sanitize_tops_up_a_short_bus_eq() {
+        let mut p = profile(vec![strip(1, StripKind::Virtual)]);
+        p.buses[0].eq.bands.truncate(3);
+        p.buses[0].eq.bands[0].gain_db = 4.0;
+        sanitize(&mut p);
+        let bands = &p.buses[0].eq.bands;
+        assert_eq!(bands.len(), 8);
+        assert_eq!(bands[0].gain_db, 4.0, "the user's own bands are kept");
+        assert_eq!(&bands[3..], &EqParams::bus_default().bands[3..]);
     }
 
     /// A profile with extra buses keeps them, routes included.

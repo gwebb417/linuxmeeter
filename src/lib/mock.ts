@@ -5,7 +5,7 @@
  * design iteration feels like the real app.
  */
 import type { AppState, BusId, MeterFrame, StripState, VbanRecv, VbanSend } from "./types";
-import { BUS_IDS, LABEL_MAX, MAX_STRIPS, VBAN_DEFAULT_PORT, VBAN_STREAM_NAME_MAX, defaultPan, isOutputBus } from "./types";
+import { BUS_EQ_BANDS, BUS_IDS, LABEL_MAX, MAX_STRIPS, VBAN_DEFAULT_PORT, VBAN_STREAM_NAME_MAX, defaultPan, isOutputBus } from "./types";
 import type { Ipc, Target } from "./ipc";
 import { powerSum } from "./utils/db";
 
@@ -80,6 +80,10 @@ const looksLikeIp = (s: string) => IPV4.test(s) || (s.includes(":") && /^[0-9a-f
 const routes = (on: BusId[]): Partial<Record<BusId, boolean>> =>
   Object.fromEntries(BUS_IDS.map((b) => [b, on.includes(b)]));
 
+/** Deep copy of what arrives from the UI. The real backend gets JSON over IPC;
+ *  structuredClone would throw on the Svelte state proxies inside. */
+const plain = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
+
 /** Mirrors lm_protocol::clean_label. */
 function cleanLabel(raw: string): string | null {
   // eslint-disable-next-line no-control-regex
@@ -98,10 +102,10 @@ const state: AppState = {
     { id: 5, kind: "virtual", label: "Chat", hwKey: null, online: true, gainDb: -6, mute: false, solo: false, routes: routes(["A2", "B1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), pan: defaultPan(), vban: null },
   ],
   buses: [
-    { id: "A1", label: "Speakers", targetHwKey: "alsa_output.pci-0000_2f_00.1.hdmi-stereo", online: true, gainDb: 0, mute: false, limiter: defaultLimiter(), vban: defaultVbanSend("A1") },
-    { id: "A2", label: "Headphones", targetHwKey: "alsa_output.usb-ZOOM_Corporation_UAC-2", online: true, gainDb: -2.5, mute: false, limiter: defaultLimiter(), vban: defaultVbanSend("A2") },
-    { id: "B1", label: "Stream Mic", targetHwKey: null, online: true, gainDb: 0, mute: false, limiter: defaultLimiter(), vban: defaultVbanSend("B1") },
-    { id: "B2", label: "Aux", targetHwKey: null, online: true, gainDb: -6, mute: false, limiter: defaultLimiter(), vban: defaultVbanSend("B2") },
+    { id: "A1", label: "Speakers", targetHwKey: "alsa_output.pci-0000_2f_00.1.hdmi-stereo", online: true, gainDb: 0, mute: false, limiter: defaultLimiter(), eq: { enabled: false, bands: structuredClone(BUS_EQ_BANDS) }, vban: defaultVbanSend("A1") },
+    { id: "A2", label: "Headphones", targetHwKey: "alsa_output.usb-ZOOM_Corporation_UAC-2", online: true, gainDb: -2.5, mute: false, limiter: defaultLimiter(), eq: { enabled: false, bands: structuredClone(BUS_EQ_BANDS) }, vban: defaultVbanSend("A2") },
+    { id: "B1", label: "Stream Mic", targetHwKey: null, online: true, gainDb: 0, mute: false, limiter: defaultLimiter(), eq: { enabled: false, bands: structuredClone(BUS_EQ_BANDS) }, vban: defaultVbanSend("B1") },
+    { id: "B2", label: "Aux", targetHwKey: null, online: true, gainDb: -6, mute: false, limiter: defaultLimiter(), eq: { enabled: false, bands: structuredClone(BUS_EQ_BANDS) }, vban: defaultVbanSend("B2") },
   ],
   devices: [
     { nodeName: "alsa_input.usb-ZOOM_Corporation_UAC-2", description: "ZOOM UAC-2", mediaClass: "Audio/Source", serial: 67, channels: 2 },
@@ -239,12 +243,17 @@ export const mockIpc: Ipc = {
   },
   setEqParams: (stripId, params) => {
     const s = findStrip(stripId);
-    if (s) s.eq = structuredClone(params);
+    if (s) s.eq = plain(params);
     return Promise.resolve();
   },
   setPanParams: (stripId, params) => {
     const s = findStrip(stripId);
     if (s) s.pan = { ...params, balance: Math.max(-1, Math.min(1, params.balance)) };
+    return Promise.resolve();
+  },
+  setBusEqParams: (bus, params) => {
+    const b = state.buses.find((x) => x.id === bus);
+    if (b) b.eq = plain(params);
     return Promise.resolve();
   },
   setLimiterParams: (bus, params) => {
@@ -361,7 +370,7 @@ export const mockIpc: Ipc = {
       online: true,
       gainDb: 0,
       mute: false,
-      limiter: defaultLimiter(),
+      limiter: defaultLimiter(), eq: { enabled: false, bands: structuredClone(BUS_EQ_BANDS) },
       vban: defaultVbanSend(id),
     };
     state.buses.push(bus);

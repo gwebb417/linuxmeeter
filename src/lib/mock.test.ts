@@ -89,6 +89,26 @@ describe("strip population", () => {
   });
 });
 
+describe("EQ edits", () => {
+  /** The UI passes objects that may wrap reactive proxies; the mock must copy
+   *  them, not keep references the UI can mutate behind its back. */
+  it("stores a detached copy of a bus EQ", async () => {
+    const s = await ipc.getState();
+    const eq = s.buses[0]!.eq;
+    const edited = { ...eq, enabled: true, bands: eq.bands.map((b, i) => (i === 3 ? { ...b, gainDb: 6 } : b)) };
+    await ipc.setBusEqParams("A1", edited);
+    edited.bands[3]!.gainDb = -20;
+    const after = (await ipc.getState()).buses[0]!.eq;
+    expect(after.enabled).toBe(true);
+    expect(after.bands[3]!.gainDb).toBe(6);
+  });
+
+  it("gives every bus eight EQ bands", async () => {
+    await ipc.addBus(true);
+    expect((await ipc.getState()).buses.every((b) => b.eq.bands.length === 8)).toBe(true);
+  });
+});
+
 describe("labels", () => {
   it("renames strips and buses, trimmed and bounded", async () => {
     await ipc.setLabel({ strip: 3 }, "  Game  ");

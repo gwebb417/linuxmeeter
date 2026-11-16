@@ -820,8 +820,9 @@ impl Engine {
         self.set_props(&bus.in_node(), &params::filter_params(&pairs));
     }
 
-    fn apply_eq(&self, strip: &StripState) {
-        let e = &strip.eq;
+    /// Write an EQ to the `eq` node of whichever filter-chain carries `node`
+    /// (a strip's control node or a bus's input node).
+    fn write_eq(&self, node: &str, e: &EqParams) {
         let mut pairs: Vec<(String, f32)> = vec![("eq:enabled".into(), e.enabled as u32 as f32)];
         for (i, band) in e.bands.iter().enumerate().take(8) {
             pairs.push((format!("eq:ft_{i}"), band.kind.lsp_filter_type()));
@@ -830,7 +831,15 @@ impl Engine {
             pairs.push((format!("eq:q_{i}"), band.q.clamp(0.0, 100.0)));
         }
         let borrowed: Vec<(&str, f32)> = pairs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
-        self.set_props(&strip.control_node(), &params::filter_params(&borrowed));
+        self.set_props(node, &params::filter_params(&borrowed));
+    }
+
+    fn apply_eq(&self, strip: &StripState) {
+        self.write_eq(&strip.control_node(), &strip.eq);
+    }
+
+    fn apply_bus_eq(&self, bus: &BusState) {
+        self.write_eq(&bus.in_node(), &bus.eq);
     }
 
     /// Mono / reverse / balance, as the two stereo-image mixers' gains.
@@ -857,6 +866,7 @@ impl Engine {
         }
         if let Some(b) = self.app.buses.iter().find(|b| b.in_node() == node_name) {
             self.apply_gain(Target::Bus { bus: b.id });
+            self.apply_bus_eq(b);
             self.apply_limiter(b);
             self.apply_bus_mute(b.id);
         }
@@ -961,6 +971,15 @@ impl Engine {
                 }
                 if let Some(s) = self.app.strips.iter().find(|s| s.id == strip) {
                     self.apply_pan(s);
+                }
+                self.dirty = true;
+            }
+            EngineCommand::SetBusEqParams { bus, params } => {
+                if let Some(b) = self.app.buses.iter_mut().find(|b| b.id == bus) {
+                    b.eq = params;
+                }
+                if let Some(b) = self.app.buses.iter().find(|b| b.id == bus) {
+                    self.apply_bus_eq(b);
                 }
                 self.dirty = true;
             }
@@ -1102,6 +1121,7 @@ fn bus(id: BusId, label: &str, target: Option<String>) -> BusState {
         gain_db: 0.0,
         mute: false,
         limiter: LimiterParams::default(),
+        eq: EqParams::bus_default(),
         vban: VbanSend { stream_name: format!("linuxmeeter-{id:?}"), ..VbanSend::default() },
     }
 }

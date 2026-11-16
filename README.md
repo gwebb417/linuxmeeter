@@ -25,7 +25,8 @@ OBS, or any recorder can use.
   (swap left/right) buttons plus a balance slider, applied after the EQ
 - **Output buses** — up to five A buses (A1–A5) to hardware devices and
   three B buses (B1–B3) as **virtual microphones** (post-limiter) selectable
-  in any app; add them with **+A** / **+B**
+  in any app; add them with **+A** / **+B**. Every bus has an 8-band
+  parametric **EQ** ahead of its limiter
 - **Your own layout** — add hardware or virtual strips with **+**, remove
   any strip or bus (hover its name, click ✕ twice), double-click a name to
   rename it

@@ -84,7 +84,10 @@
         class:active={strip.eq.enabled}
         aria-pressed={strip.eq.enabled}
         title="Open equalizer"
-        onclick={() => (ui.eqStrip = strip.id)}
+        onclick={() => {
+          ui.eqBus = null;
+          ui.eqStrip = strip.id;
+        }}
       >
         EQ
       </button>

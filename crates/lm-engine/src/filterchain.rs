@@ -313,11 +313,17 @@ pub fn bus_args(bus_name: &str, label: &str, hw_target: Option<&str>) -> String 
     json!({
         "node.description": label,
         "media.name": label,
+        // EQ then limiter, so EQ boosts can never push the bus past it.
         "filter.graph": {
             "nodes": [
+                { "type": "lv2", "name": "eq",  "plugin": LV2_EQ },
                 { "type": "lv2", "name": "lim", "plugin": LV2_LIMITER },
             ],
-            "inputs":  [ "lim:in_l", "lim:in_r" ],
+            "links": [
+                { "output": "eq:out_l", "input": "lim:in_l" },
+                { "output": "eq:out_r", "input": "lim:in_r" },
+            ],
+            "inputs":  [ "eq:in_l", "eq:in_r" ],
             "outputs": [ "lim:out_l", "lim:out_r" ],
         },
         "capture.props": {
@@ -587,10 +593,18 @@ mod tests {
     }
 
     #[test]
-    fn bus_dsp_is_a_limiter() {
+    fn bus_dsp_is_eq_then_limiter() {
         let v = parse(&bus_args("lm.bus.a1", "Speakers", None));
-        assert_eq!(v["filter.graph"]["nodes"][0]["name"], "lim");
-        assert_eq!(v["filter.graph"]["inputs"][0], "lim:in_l");
+        let g = &v["filter.graph"];
+        assert_eq!(g["nodes"][0]["name"], "eq");
+        assert_eq!(g["nodes"][0]["plugin"], LV2_EQ);
+        assert_eq!(g["nodes"][1]["name"], "lim");
+        assert_eq!(g["inputs"], json!(["eq:in_l", "eq:in_r"]));
+        assert_eq!(g["outputs"], json!(["lim:out_l", "lim:out_r"]), "the limiter is always last");
+        assert_eq!(g["links"], json!([
+            { "output": "eq:out_l", "input": "lim:in_l" },
+            { "output": "eq:out_r", "input": "lim:in_r" },
+        ]));
     }
 
     #[test]

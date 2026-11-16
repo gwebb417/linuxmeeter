@@ -24,6 +24,8 @@
     void mixer.buses.length;
     if (!rack) return;
     requestAnimationFrame(() => {
+      // The rack can be gone by the next frame (unmount, hot reload).
+      if (!rack) return;
       const groups = Array.from(rack.querySelectorAll<HTMLElement>(".group"));
       if (groups.length === 0) return;
       const width = groups.reduce((sum, g) => sum + g.offsetWidth, 0) + 16 * (groups.length + 1);

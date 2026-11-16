@@ -74,6 +74,27 @@ export interface EqParams {
   bands: EqBand[];
 }
 
+/** The four EQ-panel bands of a strip (bands 4..7 belong to the color pad).
+ *  Mirrors the first half of lm_protocol::EqParams::default. */
+export const STRIP_EQ_BANDS: EqBand[] = [
+  { kind: "low_shelf", freqHz: 100, gainDb: 0, q: 0.7 },
+  { kind: "peak", freqHz: 400, gainDb: 0, q: 1 },
+  { kind: "peak", freqHz: 2500, gainDb: 0, q: 1 },
+  { kind: "high_shelf", freqHz: 8000, gainDb: 0, q: 0.7 },
+];
+
+/** A bus EQ: all eight bands are user bands. Mirrors lm_protocol::EqParams::bus_default. */
+export const BUS_EQ_BANDS: EqBand[] = [
+  { kind: "low_shelf", freqHz: 60, gainDb: 0, q: 0.7 },
+  { kind: "peak", freqHz: 150, gainDb: 0, q: 1 },
+  { kind: "peak", freqHz: 400, gainDb: 0, q: 1 },
+  { kind: "peak", freqHz: 1000, gainDb: 0, q: 1 },
+  { kind: "peak", freqHz: 2500, gainDb: 0, q: 1 },
+  { kind: "peak", freqHz: 5000, gainDb: 0, q: 1 },
+  { kind: "peak", freqHz: 8000, gainDb: 0, q: 1 },
+  { kind: "high_shelf", freqHz: 12000, gainDb: 0, q: 0.7 },
+];
+
 /** A strip's stereo image, applied after the EQ (mirrors lm_protocol::PanParams). */
 export interface PanParams {
   /** Sum to mono (wins over reverse). */
@@ -114,6 +135,8 @@ export interface BusState {
   gainDb: number;
   mute: boolean;
   limiter: LimiterParams;
+  /** Eight user bands, before the limiter. */
+  eq: EqParams;
   vban: VbanSend;
 }
 

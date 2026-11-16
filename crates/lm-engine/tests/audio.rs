@@ -373,6 +373,7 @@ fn bus_a1() -> BusState {
         gain_db: 0.0,
         mute: false,
         limiter: LimiterParams::default(),
+        eq: lm_protocol::EqParams::bus_default(),
         vban: Default::default(),
     }
 }
@@ -463,6 +464,7 @@ fn b_bus_appears_as_a_microphone() {
         gain_db: 0.0,
         mute: false,
         limiter: LimiterParams::default(),
+        eq: lm_protocol::EqParams::bus_default(),
         vban: Default::default(),
     };
 
@@ -589,6 +591,37 @@ fn balance_hard_left_silences_the_right_channel() {
     rig.settle(300);
     let [l2, r2, ..] = rig.measure(&strip_meter, 500);
     assert!((l2 - l0).abs() < 1.0 && (r2 - r0).abs() < 1.0, "mono of identical channels is unity ({l2:.1}/{r2:.1})");
+}
+
+/// The bus EQ sits in the bus's own filter-chain, ahead of the limiter: a
+/// +6 dB bell at the tone's frequency must raise the bus output by 6 dB while
+/// the strip feeding it is unchanged.
+#[test]
+#[ignore = "requires a PipeWire daemon; run with `make test-audio`"]
+fn bus_eq_boost_raises_the_bus_level() {
+    // -12 dBFS peak leaves room for the boost.
+    let (rig, strip_meter, bus_meter, _s, b) = full_chain(0.25);
+
+    let strip_before = rig.measure(&strip_meter, 500)[0];
+    let before = rig.measure(&bus_meter, 500)[0];
+    assert!(before > -20.0, "no signal on the bus (peak {before:.1} dBFS)");
+
+    rig.set_props(
+        &b.in_node(),
+        &params::filter_params(&[
+            ("eq:enabled", 1.0),
+            ("eq:ft_3", lm_protocol::EqBandKind::Peak.lsp_filter_type()),
+            ("eq:f_3", 1000.0),
+            ("eq:g_3", params::db_to_linear(6.0)),
+            ("eq:q_3", 1.0),
+        ]),
+    );
+    rig.settle(400);
+
+    let after = rig.measure(&bus_meter, 500)[0];
+    let strip_after = rig.measure(&strip_meter, 500)[0];
+    assert!((after - before - 6.0).abs() < 1.5, "bus moved {:.2} dB, wanted +6 ({before:.1} -> {after:.1})", after - before);
+    assert!((strip_after - strip_before).abs() < 1.0, "the strip must be unaffected ({strip_before:.1} -> {strip_after:.1})");
 }
 
 /// Mute must actually silence the audio, not just grey out a button.

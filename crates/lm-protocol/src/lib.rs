@@ -144,6 +144,27 @@ impl EqParams {
     }
 }
 
+impl EqParams {
+    /// A bus EQ: all eight bands are user bands (no color pad on buses),
+    /// spread across the spectrum. Mirrors `BUS_EQ_BANDS` in types.ts.
+    pub fn bus_default() -> Self {
+        let band = |kind, freq_hz, q| EqBand { kind, freq_hz, gain_db: 0.0, q };
+        Self {
+            enabled: false,
+            bands: vec![
+                band(EqBandKind::LowShelf, 60.0, 0.7),
+                band(EqBandKind::Peak, 150.0, 1.0),
+                band(EqBandKind::Peak, 400.0, 1.0),
+                band(EqBandKind::Peak, 1000.0, 1.0),
+                band(EqBandKind::Peak, 2500.0, 1.0),
+                band(EqBandKind::Peak, 5000.0, 1.0),
+                band(EqBandKind::Peak, 8000.0, 1.0),
+                band(EqBandKind::HighShelf, 12000.0, 0.7),
+            ],
+        }
+    }
+}
+
 impl Default for EqParams {
     fn default() -> Self {
         let mut bands = vec![
@@ -391,6 +412,10 @@ pub struct BusState {
     pub gain_db: f32,
     pub mute: bool,
     pub limiter: LimiterParams,
+    /// Runs before the limiter. Profiles written before bus EQ existed get
+    /// a flat, disabled one.
+    #[serde(default = "EqParams::bus_default")]
+    pub eq: EqParams,
     /// `default` so profiles written before VBAN existed still load.
     #[serde(default)]
     pub vban: VbanSend,
@@ -472,6 +497,7 @@ pub enum EngineCommand {
     SetEqParams { strip: StripId, params: EqParams },
     SetPanParams { strip: StripId, params: PanParams },
     SetLimiterParams { bus: BusId, params: LimiterParams },
+    SetBusEqParams { bus: BusId, params: EqParams },
     /// Point a hardware strip at a different capture device (module reload).
     SetStripDevice { strip: StripId, hw_key: String },
     /// Point an A-bus at a different output device (module reload).
@@ -547,6 +573,7 @@ mod tests {
             gain_db: 0.0,
             mute: false,
             limiter: LimiterParams::default(),
+            eq: EqParams::bus_default(),
             vban: VbanSend::default(),
         }
     }
@@ -697,6 +724,7 @@ mod tests {
             EngineCommand::RemoveStrip { strip: 9 },
             EngineCommand::AddStrip { kind: StripKind::Hardware, label: "Guitar".into() },
             EngineCommand::AddBus { output: true },
+            EngineCommand::SetBusEqParams { bus: BusId::B2, params: EqParams::bus_default() },
             EngineCommand::SetPanParams { strip: 2, params: PanParams { mono: true, ..Default::default() } },
             EngineCommand::RemoveBus { bus: BusId::A4 },
             EngineCommand::SetLabel { target: Target::Bus { bus: BusId::B3 }, label: "Discord".into() },
@@ -773,6 +801,32 @@ mod tests {
         assert_eq!(clean_label(&"x".repeat(50)).map(|s| s.len()), Some(LABEL_MAX));
         assert_eq!(clean_label("   "), None);
         assert_eq!(clean_label("Café ♪").as_deref(), Some("Café ♪"), "labels may be any printable text");
+    }
+
+    // ---- bus EQ ------------------------------------------------------------
+
+    /// Buses have no color pad, so all eight bands are user bands, flat,
+    /// ascending, shelves at the ends, and off until the user turns it on.
+    #[test]
+    fn bus_eq_defaults_to_eight_flat_ascending_bands() {
+        let eq = EqParams::bus_default();
+        assert!(!eq.enabled);
+        assert_eq!(eq.bands.len(), 8);
+        assert!(eq.bands.iter().all(|b| b.gain_db == 0.0));
+        assert!(eq.bands.windows(2).all(|w| w[0].freq_hz < w[1].freq_hz));
+        assert_eq!(eq.bands[0].kind, EqBandKind::LowShelf);
+        assert_eq!(eq.bands[7].kind, EqBandKind::HighShelf);
+        assert!(eq.bands[1..7].iter().all(|b| b.kind == EqBandKind::Peak));
+    }
+
+    /// An old profile's bus has no `eq` key: it must get the bus layout, not
+    /// the strip one (whose upper four bands belong to the color pad).
+    #[test]
+    fn a_bus_without_eq_gets_the_bus_layout() {
+        let mut v = serde_json::to_value(bus(BusId::A1, Some("x"))).unwrap();
+        v.as_object_mut().unwrap().remove("eq");
+        let b: BusState = serde_json::from_value(v).unwrap();
+        assert_eq!(b.eq, EqParams::bus_default());
     }
 
     // ---- stereo image ------------------------------------------------------

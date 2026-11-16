@@ -7,12 +7,14 @@
   import EqPanel from "./components/EqPanel.svelte";
   import DynPanel from "./components/DynPanel.svelte";
   import VbanPanel from "./components/VbanPanel.svelte";
+  import { BUS_EQ_BANDS, STRIP_EQ_BANDS } from "./lib/types";
 
   onMount(() => {
     void mixer.init();
   });
 
   let eqStrip = $derived(ui.eqStrip !== null ? mixer.strip(ui.eqStrip) : undefined);
+  let eqBus = $derived(ui.eqBus !== null ? mixer.bus(ui.eqBus) : undefined);
   let dynStrip = $derived(ui.dynStrip !== null ? mixer.strip(ui.dynStrip) : undefined);
 </script>
 
@@ -25,7 +27,25 @@
   {/if}
 </div>
 {#if eqStrip}
-  <EqPanel strip={eqStrip} />
+  {@const s = eqStrip}
+  <EqPanel
+    title={s.label}
+    eq={s.eq}
+    editable={4}
+    resetBands={STRIP_EQ_BANDS}
+    onchange={(eq) => mixer.setEqParams(s.id, eq)}
+    onclose={() => (ui.eqStrip = null)}
+  />
+{:else if eqBus}
+  {@const b = eqBus}
+  <EqPanel
+    title={`${b.id} ${b.label}`}
+    eq={b.eq}
+    editable={8}
+    resetBands={BUS_EQ_BANDS}
+    onchange={(eq) => mixer.setBusEqParams(b.id, eq)}
+    onclose={() => (ui.eqBus = null)}
+  />
 {/if}
 {#if dynStrip}
   <DynPanel strip={dynStrip} />

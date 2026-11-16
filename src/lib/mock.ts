@@ -4,7 +4,7 @@
  * meters actually respond when you pull a fader or punch a route button —
  * design iteration feels like the real app.
  */
-import type { AppState, BusId, MacroAction, MacroButton, MeterFrame, StripState, Switch, VbanRecv, VbanSend } from "./types";
+import { NO_DEVICE, type AppState, type BusId, type MacroAction, type MacroButton, type MeterFrame, type StripState, type Switch, type VbanRecv, type VbanSend } from "./types";
 import {
   BUS_EQ_BANDS,
   BUS_IDS,
@@ -407,7 +407,10 @@ export const mockIpc: Ipc = {
   },
   setBusTarget: (bus, hwKey) => {
     const b = state.buses.find((x) => x.id === bus);
-    if (b) b.targetHwKey = hwKey;
+    if (b) {
+      b.targetHwKey = hwKey;
+      b.online = hwKey !== NO_DEVICE;
+    }
     return Promise.resolve();
   },
   setBusVban: (bus, config) => {
@@ -501,12 +504,12 @@ export const mockIpc: Ipc = {
   addBus: (output) => {
     const id = BUS_IDS.find((b) => isOutputBus(b) === output && !state.buses.some((x) => x.id === b));
     if (!id) return reject(output ? "all five A buses are in use" : "all three B buses are in use");
-    const targetHwKey = output ? (state.devices.find((d) => d.mediaClass === "Audio/Sink")?.nodeName ?? null) : null;
+    const targetHwKey = output ? (state.devices.find((d) => d.mediaClass === "Audio/Sink")?.nodeName ?? NO_DEVICE) : null;
     const bus = {
       id,
       label: `${output ? "Output" : "Virtual"} ${id}`,
       targetHwKey,
-      online: true,
+      online: targetHwKey !== NO_DEVICE,
       gainDb: 0,
       mute: false,
       limiter: defaultLimiter(), eq: { enabled: false, bands: structuredClone(BUS_EQ_BANDS) },

@@ -6,9 +6,11 @@ export type BusId = "A1" | "A2" | "A3" | "A4" | "A5" | "B1" | "B2" | "B3";
 export const BUS_IDS: BusId[] = ["A1", "A2", "A3", "A4", "A5", "B1", "B2", "B3"];
 export const isOutputBus = (id: BusId): boolean => id.startsWith("A");
 
-/** Mirrors lm_protocol::MAX_STRIPS / LABEL_MAX. */
+/** Mirrors lm_protocol::MAX_STRIPS / LABEL_MAX / NO_DEVICE. */
 export const MAX_STRIPS = 16;
 export const LABEL_MAX = 32;
+/** `targetHwKey` of an A bus with no output device chosen yet (B buses are null). */
+export const NO_DEVICE = "";
 
 export type StripKind = "virtual" | "hardware" | "vban";
 

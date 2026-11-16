@@ -45,6 +45,14 @@ describe("bus population", () => {
     expect(s.buses.find((b) => b.id === "B3")?.targetHwKey).toBeNull();
   });
 
+  it("an A bus can be added back after removing them all", async () => {
+    await ipc.removeBus("A1");
+    await ipc.removeBus("A2");
+    await ipc.addBus(true);
+    expect(await busIds()).toEqual(["A1", "B1", "B2"]);
+    expect(errors).toEqual([]);
+  });
+
   it("removing a bus drops every route into it", async () => {
     await ipc.removeBus("B1");
     const s = await ipc.getState();

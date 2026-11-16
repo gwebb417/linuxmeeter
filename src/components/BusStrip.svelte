@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { BusState } from "../lib/types";
+  import { NO_DEVICE, type BusState } from "../lib/types";
   import { mixer } from "../lib/state/mixer.svelte";
   import { ui } from "../lib/state/ui.svelte";
   import StripHeader from "./StripHeader.svelte";
@@ -24,7 +24,9 @@
   let deviceDisplay = $derived(
     isVirtual
       ? "virtual source"
-      : (mixer.devices.find((d) => d.nodeName === bus.targetHwKey)?.description ?? bus.targetHwKey ?? "—"),
+      : bus.targetHwKey === NO_DEVICE
+        ? "no device"
+        : (mixer.devices.find((d) => d.nodeName === bus.targetHwKey)?.description ?? bus.targetHwKey ?? "—"),
   );
 </script>
 

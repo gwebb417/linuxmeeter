@@ -14,7 +14,7 @@ use std::time::Duration;
 use lm_protocol::{
     clean_label, AppState, BusId, BusState, CompParams, DeviceInfo, EngineCommand, EngineEvent, EqParams,
     FxKind, FxState, GateParams, LimiterParams, MacroAction, MacroButton, MacroMode, StripId, StripKind,
-    StripState, Target, VbanRecv, VbanSend, MAX_MACROS, MAX_STRIPS,
+    StripState, Target, VbanRecv, VbanSend, MAX_MACROS, MAX_STRIPS, NO_DEVICE,
 };
 use pipewire::context::ContextRc;
 use pipewire::core::CoreRc;
@@ -810,14 +810,11 @@ impl Engine {
         let Some(id) = free else {
             return self.report(if output { "all five A buses are in use" } else { "all three B buses are in use" });
         };
-        let target = if output {
-            match self.hardware_default("Audio/Sink") {
-                Some(t) => Some(t),
-                None => return self.report("no output device for a new A bus"),
-            }
-        } else {
-            None
-        };
+        // An A bus with no device to play to is still added, aimed at
+        // nothing (`NO_DEVICE`); the user picks its output from the bus.
+        // Refusing would strand anyone who removed every A bus on a machine
+        // whose only sinks are our own.
+        let target = output.then(|| self.hardware_default("Audio/Sink").unwrap_or_else(|| NO_DEVICE.into()));
         let label = format!("{} {id:?}", if output { "Output" } else { "Virtual" });
         let b = bus(id, &label, target);
         // Keep A1..A5, B1..B3 order; taps stay index-aligned.
@@ -959,7 +956,7 @@ impl Engine {
         self.model
             .nodes
             .values()
-            .filter(|n| n.media_class == class && n.name.starts_with("alsa_"))
+            .filter(|n| n.media_class == class && (n.name.starts_with("alsa_") || n.name.starts_with("bluez_")))
             .map(|n| n.name.clone())
             .next()
     }
@@ -1248,6 +1245,7 @@ impl Engine {
                     if b.target_hw_key.is_none() {
                         return; // B buses are virtual sources; no target to set
                     }
+                    b.online = hw_key != NO_DEVICE;
                     b.target_hw_key = Some(hw_key);
                 }
                 self.reload_bus(bus);
@@ -1356,8 +1354,8 @@ fn bus(id: BusId, label: &str, target: Option<String>) -> BusState {
     BusState {
         id,
         label: label.into(),
+        online: target.as_deref() != Some(NO_DEVICE),
         target_hw_key: target,
-        online: true,
         gain_db: 0.0,
         mute: false,
         limiter: LimiterParams::default(),

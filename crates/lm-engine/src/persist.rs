@@ -8,7 +8,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use lm_protocol::{BusState, StripKind, StripState};
+use lm_protocol::{BusState, StripKind, StripState, NO_DEVICE};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,7 +96,7 @@ fn sanitize(p: &mut Profile) {
         }
     }
     for b in &mut p.buses {
-        b.online = true;
+        b.online = b.target_hw_key.as_deref() != Some(NO_DEVICE);
         // A hand-edited bus EQ with too few bands is topped up with the
         // defaults for the missing slots (the plugin always has eight).
         let defaults = lm_protocol::EqParams::bus_default().bands;

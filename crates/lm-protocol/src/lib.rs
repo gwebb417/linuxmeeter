@@ -40,6 +40,9 @@ impl BusId {
 pub const MAX_STRIPS: usize = 16;
 /// Longest label a strip or bus may carry.
 pub const LABEL_MAX: usize = 32;
+/// `target_hw_key` of an A bus that has no output device chosen: it stays an
+/// output bus (not a B bus, which is `None`) but plays nowhere until one is.
+pub const NO_DEVICE: &str = "";
 
 /// Normalize a user-entered strip/bus label: trimmed, control characters
 /// removed, at most [`LABEL_MAX`] characters. None if nothing is left.
@@ -653,7 +656,8 @@ impl StripState {
 pub struct BusState {
     pub id: BusId,
     pub label: String,
-    /// `node.name` of the hardware sink this bus feeds (A buses). None = virtual source (B buses).
+    /// `node.name` of the hardware sink this bus feeds (A buses), or `NO_DEVICE`
+    /// if none is chosen yet. None = virtual source (B buses).
     pub target_hw_key: Option<String>,
     pub online: bool,
     pub gain_db: f32,

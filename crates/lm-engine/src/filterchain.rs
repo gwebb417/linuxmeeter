@@ -9,6 +9,7 @@ use std::ffi::{c_void, CString};
 use std::ptr::NonNull;
 
 use pipewire::context::ContextRc;
+use lm_protocol::NO_DEVICE;
 use serde_json::json;
 
 #[derive(Debug, thiserror::Error)]
@@ -476,6 +477,17 @@ pub fn vban_recv_has_rules(version: &str) -> bool {
 /// microphone (`media.class = Audio/Source`) for Discord/OBS/etc.
 pub fn bus_args(bus_name: &str, label: &str, hw_target: Option<&str>) -> String {
     let playback_props = match hw_target {
+        // An A bus with no device yet: an output stream nothing links, so it
+        // can never fall through to the default sink (which may be one of
+        // our own strips while we hold the default output).
+        Some(NO_DEVICE) => json!({
+            "node.name": format!("{bus_name}.out"),
+            "node.description": format!("{label} (out)"),
+            "node.autoconnect": false,
+            "node.dont-reconnect": true,
+            "node.virtual": true,
+            "state.restore-props": false,
+        }),
         Some(target) => json!({
             "node.name": format!("{bus_name}.out"),
             "node.description": format!("{label} (out)"),
@@ -542,6 +554,7 @@ mod tests {
             ("virtual strip autoconnected", virtual_strip_args("lm.strip.1", "System", true)),
             ("hardware strip", hardware_strip_args("lm.strip.2", "Mic", "alsa_input.usb-foo")),
             ("A bus", bus_args("lm.bus.a1", "Speakers", Some("alsa_output.usb-foo"))),
+            ("A bus without a device", bus_args("lm.bus.a2", "Output A2", Some(NO_DEVICE))),
             ("B bus", bus_args("lm.bus.b1", "Stream Mic", None)),
             ("VBAN strip", vban_strip_args("lm.strip.6", "Remote")),
         ]
@@ -723,6 +736,18 @@ mod tests {
         assert_eq!(v["playback.props"]["target.object"], "alsa_output.hdmi");
     }
 
+    /// An A bus with no device must stay an output (its `.out` node, which
+    /// `tap_node` meters) but never be autoconnected: the default sink may
+    /// be one of our own strips, which would loop the bus back into itself.
+    #[test]
+    fn a_bus_without_a_device_plays_nowhere() {
+        let v = parse(&bus_args("lm.bus.a2", "Output A2", Some(NO_DEVICE)));
+        assert_eq!(v["playback.props"]["node.name"], "lm.bus.a2.out");
+        assert_eq!(v["playback.props"]["node.autoconnect"], Value::Bool(false));
+        assert!(v["playback.props"].get("target.object").is_none());
+        assert!(v["playback.props"].get("media.class").is_none());
+    }
+
     /// B buses are the virtual microphones Discord/OBS select; the node must
     /// carry the bus name itself, since that is what `tap_node` meters.
     #[test]
@@ -805,7 +830,7 @@ mod tests {
         assert_eq!(v["capture.props"]["audio.position"], json!(["SL", "SR"]));
         assert_eq!(v["playback.props"]["node.name"], "lm.fx.reverb.out");
         assert_eq!(v["playback.props"]["audio.position"], json!(["FL", "FR"]));
-        assert_eq!(v["playback.props"]["node.autoconnect"], false);
+        assert_eq!(v["playback.props"]["node.autoconnect"], Value::Bool(false));
     }
 
     #[test]

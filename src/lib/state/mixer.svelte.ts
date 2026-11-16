@@ -23,6 +23,7 @@ import type {
   VbanSend,
 } from "../types";
 import { ipc, type Target } from "../ipc";
+import { NO_DEVICE } from "../types";
 import { ingestFrame } from "./meters";
 
 class MixerStore {
@@ -231,7 +232,10 @@ class MixerStore {
 
   setBusTarget(bus: BusId, hwKey: string): void {
     const b = this.bus(bus);
-    if (b) b.targetHwKey = hwKey;
+    if (b) {
+      b.targetHwKey = hwKey;
+      b.online = hwKey !== NO_DEVICE;
+    }
     void ipc.setBusTarget(bus, hwKey);
   }
 

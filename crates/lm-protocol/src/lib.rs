@@ -1084,6 +1084,93 @@ mod tests {
         assert_eq!(clean_label("Café ♪").as_deref(), Some("Café ♪"), "labels may be any printable text");
     }
 
+    // ---- payloads exactly as the frontend sends them ------------------------
+
+    /// What `src/lib` builds for each new command, written the way JSON.stringify
+    /// would: integers where TypeScript has whole numbers, null for missing
+    /// shortcuts, partial route maps. If any of these stops deserializing, the
+    /// real app's command silently fails while the mock backend keeps working.
+    #[test]
+    fn frontend_payloads_deserialize() {
+        use serde_json::{from_value, json};
+
+        // types.ts defaultFx("echo") after a knob turn
+        let fx: FxState = from_value(json!({
+            "kind": "echo", "returnDb": -6, "mute": false, "routes": { "A1": true },
+            "timeMs": 350, "amount": 0.4
+        }))
+        .unwrap();
+        assert_eq!(fx, FxState::default_for(FxKind::Echo));
+
+        let sends: FxSends = from_value(json!({ "reverb": 0.25, "echo": 0 })).unwrap();
+        assert_eq!(sends, FxSends { reverb: 0.25, echo: 0.0 });
+
+        let pan: PanParams = from_value(json!({ "mono": false, "reverse": true, "balance": -1 })).unwrap();
+        assert_eq!(pan.matrix(), [[0.0, 1.0], [0.0, 0.0]]);
+
+        // MacroEditor's fresh() for every action type, plus a captured key / none
+        let m: MacroButton = from_value(json!({
+            "id": 3, "label": "Talk", "mode": "push", "key": null, "active": false,
+            "on": [
+                { "type": "mute", "target": { "strip": 1 }, "value": "toggle" },
+                { "type": "solo", "strip": 1, "value": "toggle" },
+                { "type": "route", "strip": 1, "bus": "A1", "value": "toggle" },
+                { "type": "gain", "target": { "strip": 1 }, "db": 0 },
+                { "type": "fx_mute", "fx": "reverb", "value": "toggle" },
+                { "type": "vban_send", "bus": "A1", "value": "toggle" },
+                { "type": "default_output", "value": "toggle" }
+            ],
+            "off": [ { "type": "gain", "target": { "bus": "B3" }, "db": -12.5 } ]
+        }))
+        .unwrap();
+        assert_eq!(m.on.len(), 7);
+        assert_eq!(m.off[0], MacroAction::Gain { target: Target::Bus { bus: BusId::B3 }, db: -12.5 });
+        let keyed: MacroButton =
+            from_value(json!({ "id": 4, "label": "x", "mode": "toggle", "on": [], "off": [], "key": "Ctrl+Shift+M", "active": true })).unwrap();
+        assert_eq!(keyed.key.as_deref(), Some("Ctrl+Shift+M"));
+
+        // types.ts BUS_EQ_BANDS as sent by the bus EQ panel
+        let eq: EqParams = from_value(json!({
+            "enabled": true,
+            "bands": [
+                { "kind": "low_shelf", "freqHz": 60, "gainDb": 0, "q": 0.7 },
+                { "kind": "peak", "freqHz": 1000, "gainDb": 7.9, "q": 1 },
+                { "kind": "high_shelf", "freqHz": 12000, "gainDb": -3, "q": 0.7 }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(eq.bands[1].gain_db, 7.9);
+
+        // add_strip / set_label / remove_bus arguments
+        assert_eq!(from_value::<StripKind>(json!("virtual")).unwrap(), StripKind::Virtual);
+        assert_eq!(from_value::<Target>(json!({ "bus": "B3" })).unwrap(), Target::Bus { bus: BusId::B3 });
+        assert_eq!(from_value::<BusId>(json!("A5")).unwrap(), BusId::A5);
+    }
+
+    /// And the other direction: the TS mirror's keys for the new state.
+    #[test]
+    fn new_state_uses_the_keys_types_ts_reads() {
+        let mut s = strip(1, StripKind::Virtual);
+        s.sends.reverb = 0.5;
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["sends"], serde_json::json!({ "reverb": 0.5, "echo": 0.0 }));
+        assert!(v["pan"].get("balance").is_some());
+        let b = serde_json::to_value(bus(BusId::A1, Some("x"))).unwrap();
+        assert!(b["eq"]["bands"][0].get("freqHz").is_some());
+        let m = serde_json::to_value(MacroButton {
+            id: 1,
+            label: "x".into(),
+            mode: MacroMode::Toggle,
+            on: vec![MacroAction::FxMute { fx: FxKind::Echo, value: Switch::On }],
+            off: vec![],
+            key: None,
+            active: false,
+        })
+        .unwrap();
+        assert_eq!(m["on"][0], serde_json::json!({ "type": "fx_mute", "fx": "echo", "value": "on" }));
+        assert!(m["key"].is_null());
+    }
+
     // ---- macro buttons -----------------------------------------------------
 
     #[test]

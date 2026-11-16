@@ -72,7 +72,16 @@ struct PortConfigurator {
     _core: CoreRc,
     _registry: pipewire::registry::RegistryRc,
     _listener: pipewire::registry::Listener,
-    _configured: Rc<RefCell<HashMap<u32, Node>>>,
+    _configured: Rc<RefCell<HashMap<u32, Configured>>>,
+}
+
+/// A bound lm.* node waiting for (or done with) its PortConfig. The node's
+/// channel layout is only in its full info, not the registry global, so the
+/// config is set from the info event.
+struct Configured {
+    node: Node,
+    _info: Option<pipewire::node::NodeListener>,
+    done: bool,
 }
 
 impl PortConfigurator {
@@ -84,7 +93,7 @@ impl PortConfigurator {
         }
         let core = context.connect_rc(None).expect("second connection for port config");
         let registry = core.get_registry_rc().expect("registry");
-        let configured: Rc<RefCell<HashMap<u32, Node>>> = Rc::default();
+        let configured: Rc<RefCell<HashMap<u32, Configured>>> = Rc::default();
         let listener = {
             let added = configured.clone();
             let removed = configured.clone();
@@ -107,12 +116,33 @@ impl PortConfigurator {
                     }
                     let Some(registry) = registry_weak.upgrade() else { return };
                     let Ok(node) = registry.bind::<Node, _>(global) else { return };
-                    let bytes = dsp_port_config(class);
-                    let pod = libspa::pod::Pod::from_bytes(&bytes).expect("valid PortConfig pod");
-                    node.set_param(libspa::param::ParamType::PortConfig, 0, pod);
+                    // Keep the node's own channel layout, as WirePlumber does:
+                    // strip outputs carry six channels, effect inputs a
+                    // surround pair, everything else stereo. The layout is in
+                    // the node's info, which arrives as an event.
+                    let id = global.id;
+                    let class = class.to_string();
+                    let map = Rc::downgrade(&added);
+                    let info = node
+                        .add_listener_local()
+                        .info(move |info| {
+                            let Some(map) = map.upgrade() else { return };
+                            let mut map = map.borrow_mut();
+                            let Some(entry) = map.get_mut(&id) else { return };
+                            if entry.done {
+                                return;
+                            }
+                            let positions =
+                                info.props().and_then(|p| p.get("audio.position")).map(parse_positions).unwrap_or_default();
+                            let bytes = dsp_port_config(&class, &positions);
+                            let pod = libspa::pod::Pod::from_bytes(&bytes).expect("valid PortConfig pod");
+                            entry.node.set_param(libspa::param::ParamType::PortConfig, 0, pod);
+                            entry.done = true;
+                        })
+                        .register();
                     // Keep the proxy until the node goes, so the param isn't
                     // raced by the proxy's own destruction.
-                    added.borrow_mut().insert(global.id, node);
+                    added.borrow_mut().insert(id, Configured { node, _info: Some(info), done: false });
                 })
                 .global_remove(move |id| {
                     removed.borrow_mut().remove(&id);
@@ -123,7 +153,29 @@ impl PortConfigurator {
     }
 }
 
-fn dsp_port_config(media_class: &str) -> Vec<u8> {
+/// `audio.position` as a node property ("FL,FR,SL,SR" or "[ FL FR ]") to SPA
+/// channel ids. Unknown names make the whole list empty (stereo fallback).
+fn parse_positions(s: &str) -> Vec<u32> {
+    use libspa::sys::*;
+    let ids: Option<Vec<u32>> = s
+        .split(|c: char| c == ',' || c.is_whitespace() || c == '[' || c == ']' || c == '"')
+        .filter(|t| !t.is_empty())
+        .map(|t| match t {
+            "FL" => Some(SPA_AUDIO_CHANNEL_FL),
+            "FR" => Some(SPA_AUDIO_CHANNEL_FR),
+            "FC" => Some(SPA_AUDIO_CHANNEL_FC),
+            "LFE" => Some(SPA_AUDIO_CHANNEL_LFE),
+            "SL" => Some(SPA_AUDIO_CHANNEL_SL),
+            "SR" => Some(SPA_AUDIO_CHANNEL_SR),
+            "RL" => Some(SPA_AUDIO_CHANNEL_RL),
+            "RR" => Some(SPA_AUDIO_CHANNEL_RR),
+            _ => None,
+        })
+        .collect();
+    ids.unwrap_or_default()
+}
+
+fn dsp_port_config(media_class: &str, positions: &[u32]) -> Vec<u8> {
     use libspa::pod::{Object, Property, PropertyFlags, Value};
     use libspa::utils::Id;
 
@@ -134,13 +186,17 @@ fn dsp_port_config(media_class: &str) -> Vec<u8> {
         libspa::sys::SPA_DIRECTION_OUTPUT
     };
 
+    let channels: &[u32] = if positions.is_empty() {
+        &[libspa::sys::SPA_AUDIO_CHANNEL_FL, libspa::sys::SPA_AUDIO_CHANNEL_FR]
+    } else {
+        positions
+    };
     let mut info = libspa::param::audio::AudioInfoRaw::new();
     info.set_format(libspa::param::audio::AudioFormat::F32P);
     info.set_rate(RATE);
-    info.set_channels(2);
+    info.set_channels(channels.len() as u32);
     let mut position = [0u32; libspa::sys::SPA_AUDIO_MAX_CHANNELS as usize];
-    position[0] = libspa::sys::SPA_AUDIO_CHANNEL_FL;
-    position[1] = libspa::sys::SPA_AUDIO_CHANNEL_FR;
+    position[..channels.len()].copy_from_slice(channels);
     info.set_position(position);
 
     let prop = |key, value| Property { key, flags: PropertyFlags::empty(), value };

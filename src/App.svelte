@@ -8,6 +8,36 @@
   import DynPanel from "./components/DynPanel.svelte";
   import VbanPanel from "./components/VbanPanel.svelte";
   import FxPanel from "./components/FxPanel.svelte";
+  import MacroBar from "./components/MacroBar.svelte";
+  import MacroEditor from "./components/MacroEditor.svelte";
+  import { isTyping, shortcutName } from "./lib/utils/keys";
+
+  // Macro shortcuts work while the window has focus (Wayland has no global
+  // hotkeys). Keyed by physical key so a release still matches after a
+  // modifier was let go first.
+  const heldKeys = new Map<string, number>();
+
+  function onShortcut(e: KeyboardEvent) {
+    if (ui.macroEditor || isTyping(e.target) || !mixer.ready) return;
+    const name = shortcutName(e);
+    const m = name ? mixer.macros.find((x) => x.key === name) : undefined;
+    if (!m) return;
+    e.preventDefault();
+    if (e.repeat || heldKeys.has(e.code)) return;
+    heldKeys.set(e.code, m.id);
+    mixer.triggerMacro(m.id, true);
+  }
+  function onShortcutUp(e: KeyboardEvent) {
+    const id = heldKeys.get(e.code);
+    if (id === undefined) return;
+    heldKeys.delete(e.code);
+    mixer.triggerMacro(id, false);
+  }
+  /** Losing focus mid-hold would leave a push button stuck on. */
+  function releaseAll() {
+    for (const id of heldKeys.values()) mixer.triggerMacro(id, false);
+    heldKeys.clear();
+  }
   import { BUS_EQ_BANDS, STRIP_EQ_BANDS } from "./lib/types";
 
   onMount(() => {
@@ -19,8 +49,13 @@
   let dynStrip = $derived(ui.dynStrip !== null ? mixer.strip(ui.dynStrip) : undefined);
 </script>
 
+<svelte:window onkeydown={onShortcut} onkeyup={onShortcutUp} onblur={releaseAll} />
+
 <div class="app">
   <TopBar />
+  {#if ui.macroBar && mixer.ready}
+    <MacroBar />
+  {/if}
   {#if mixer.ready}
     <StripRack />
   {:else}
@@ -56,6 +91,9 @@
 {/if}
 {#if ui.fxOpen && mixer.ready}
   <FxPanel />
+{/if}
+{#if ui.macroEditor && mixer.ready}
+  <MacroEditor />
 {/if}
 {#if mixer.notice}
   <div class="notice" role="alert">{mixer.notice}</div>

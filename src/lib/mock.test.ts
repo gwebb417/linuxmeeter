@@ -139,6 +139,62 @@ describe("effects", () => {
   });
 });
 
+describe("macro buttons", () => {
+  const talk = {
+    id: 1,
+    label: "Talk",
+    mode: "push" as const,
+    on: [{ type: "route" as const, strip: 3, bus: "B1" as const, value: "on" as const }],
+    off: [{ type: "route" as const, strip: 3, bus: "B1" as const, value: "off" as const }],
+    key: " F1 ",
+    active: true,
+  };
+
+  it("stores a normalized list", async () => {
+    await ipc.setMacros([talk, { ...talk, label: "dupe" }, { ...talk, id: 2, label: "  " }]);
+    const m = (await ipc.getState()).macros;
+    expect(m.map((x) => x.id)).toEqual([1, 2]);
+    expect(m[0]!.key).toBe("F1");
+    expect(m[0]!.active).toBe(false);
+    expect(m[1]!.label).toBe("Macro 2");
+  });
+
+  it("push buttons act while held, ignoring repeats and stray releases", async () => {
+    await ipc.setMacros([talk]);
+    const routed = async () => (await ipc.getState()).strips.find((s) => s.id === 3)!.routes.B1;
+    await ipc.triggerMacro(1, true);
+    expect(await routed()).toBe(true);
+    await ipc.triggerMacro(1, true); // repeat
+    await ipc.triggerMacro(1, false);
+    expect(await routed()).toBe(false);
+    expect((await ipc.getState()).macros[0]!.active).toBe(false);
+  });
+
+  it("toggle buttons alternate their two lists", async () => {
+    await ipc.setMacros([
+      {
+        id: 5,
+        label: "Mute all",
+        mode: "toggle",
+        on: [{ type: "mute", target: { bus: "A1" }, value: "toggle" }, { type: "gain", target: { strip: 3 }, db: -99 }],
+        off: [{ type: "mute", target: { bus: "A1" }, value: "toggle" }],
+        key: null,
+        active: false,
+      },
+    ]);
+    await ipc.triggerMacro(5, true);
+    let s = await ipc.getState();
+    expect(s.buses[0]!.mute).toBe(true);
+    expect(s.strips.find((x) => x.id === 3)!.gainDb).toBe(-80); // clamped
+    expect(s.macros[0]!.active).toBe(true);
+    await ipc.triggerMacro(5, false); // releasing a toggle does nothing
+    await ipc.triggerMacro(5, true);
+    s = await ipc.getState();
+    expect(s.buses[0]!.mute).toBe(false);
+    expect(s.macros[0]!.active).toBe(false);
+  });
+});
+
 describe("labels", () => {
   it("renames strips and buses, trimmed and bounded", async () => {
     await ipc.setLabel({ strip: 3 }, "  Game  ");

@@ -12,6 +12,10 @@ class UiStore {
   vbanOpen = $state(false);
   /** Effects (reverb / echo) panel. */
   fxOpen = $state(false);
+  /** The macro button bar under the top bar. */
+  macroBar = $state(false);
+  /** The macro editor dialog. */
+  macroEditor = $state(false);
 }
 
 export const ui = new UiStore();

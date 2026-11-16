@@ -28,6 +28,12 @@ OBS, or any recorder can use.
   which buses it feeds, reverb decay and damping, and echo time and feedback.
   Both run on PipeWire's built-in filters (the reverb's impulse response is
   generated on the fly), so no extra plugins are needed
+- **Macro buttons** — a bar of pads (**MACROS** in the top bar) that each
+  run a list of actions: mute, solo, route, set a fader, mute an effect
+  return, start/stop a VBAN output, or toggle Default out. **Toggle** pads
+  switch between an on and an off list; **Push** pads run one while held
+  and the other on release (push-to-talk). Each pad can have a keyboard
+  shortcut that works while the window has focus
 - **Output buses** — up to five A buses (A1–A5) to hardware devices and
   three B buses (B1–B3) as **virtual microphones** (post-limiter) selectable
   in any app; add them with **+A** / **+B**. Every bus has an 8-band

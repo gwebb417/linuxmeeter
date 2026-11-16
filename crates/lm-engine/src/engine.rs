@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use lm_protocol::{
     clean_label, AppState, BusId, BusState, CompParams, DeviceInfo, EngineCommand, EngineEvent, EqParams,
-    FxKind, FxState, GateParams, LimiterParams, StripId, StripKind, StripState, Target, VbanRecv, VbanSend,
-    MAX_STRIPS,
+    FxKind, FxState, GateParams, LimiterParams, MacroAction, MacroButton, MacroMode, StripId, StripKind,
+    StripState, Target, VbanRecv, VbanSend, MAX_MACROS, MAX_STRIPS,
 };
 use pipewire::context::ContextRc;
 use pipewire::core::CoreRc;
@@ -112,6 +112,7 @@ impl Engine {
         let profile = crate::persist::Profile {
             take_default_output: self.app.take_default_output,
             fx: self.app.fx.clone(),
+            macros: self.app.macros.clone(),
             strips: self.app.strips.clone(),
             buses: self.app.buses.clone(),
         };
@@ -157,6 +158,7 @@ impl Engine {
             self.app.buses = p.buses;
             self.app.take_default_output = p.take_default_output;
             self.app.fx = p.fx;
+            self.app.macros = p.macros;
             self.app.profile_name = profile_name;
             for s in &mut self.app.strips {
                 if s.kind == StripKind::Hardware {
@@ -460,6 +462,98 @@ impl Engine {
         self.links.set_route(&kind.out_node(), &b, on);
         self.reconcile();
         self.send_state();
+    }
+
+    // ---- macro buttons -------------------------------------------------------
+
+    fn set_macros(&mut self, macros: Vec<MacroButton>) {
+        let mut ids = HashSet::new();
+        let mut list: Vec<MacroButton> =
+            macros.into_iter().filter(|m| ids.insert(m.id)).map(|m| m.validated()).collect();
+        list.truncate(MAX_MACROS);
+        self.app.macros = list;
+        self.send_state();
+    }
+
+    /// Press/release a macro button. Toggle buttons flip on press and run
+    /// their `on` or `off` list; push buttons run `on` while held and `off`
+    /// on release. Actions run through the normal command handler, so they
+    /// behave exactly like the same change made by hand.
+    fn trigger_macro(&mut self, id: u32, pressed: bool) {
+        let Some(m) = self.app.macros.iter_mut().find(|m| m.id == id) else { return };
+        let run = match (m.mode, pressed) {
+            (MacroMode::Toggle, true) => {
+                m.active = !m.active;
+                Some(if m.active { m.on.clone() } else { m.off.clone() })
+            }
+            (MacroMode::Toggle, false) => None,
+            (MacroMode::Push, true) if !m.active => {
+                m.active = true;
+                Some(m.on.clone())
+            }
+            (MacroMode::Push, false) if m.active => {
+                m.active = false;
+                Some(m.off.clone())
+            }
+            _ => None, // key repeat, or a release without a press
+        };
+        for action in run.unwrap_or_default() {
+            if let Some(cmd) = self.macro_command(&action) {
+                self.handle(cmd);
+            }
+        }
+        self.send_state();
+    }
+
+    /// Turn an action into the command a user would have sent, resolving
+    /// toggles against current state. None if its target is gone.
+    fn macro_command(&self, action: &MacroAction) -> Option<EngineCommand> {
+        let strip = |id: StripId| self.app.strips.iter().find(|s| s.id == id);
+        let bus = |id: BusId| self.app.buses.iter().find(|b| b.id == id);
+        Some(match action {
+            MacroAction::Mute { target, value } => {
+                let current = match target {
+                    Target::Strip { strip: id } => strip(*id)?.mute,
+                    Target::Bus { bus: id } => bus(*id)?.mute,
+                };
+                EngineCommand::SetMute { target: *target, mute: value.resolve(current) }
+            }
+            MacroAction::Solo { strip: id, value } => {
+                EngineCommand::SetSolo { strip: *id, solo: value.resolve(strip(*id)?.solo) }
+            }
+            MacroAction::Route { strip: id, bus: b, value } => {
+                bus(*b)?;
+                let current = strip(*id)?.routes.get(b).copied().unwrap_or(false);
+                EngineCommand::SetRoute { strip: *id, bus: *b, on: value.resolve(current) }
+            }
+            MacroAction::Gain { target, db } => {
+                // Only if the target still exists.
+                match target {
+                    Target::Strip { strip: id } => {
+                        strip(*id)?;
+                    }
+                    Target::Bus { bus: id } => {
+                        bus(*id)?;
+                    }
+                }
+                let db = if db.is_finite() { db.clamp(-80.0, 12.0) } else { return None };
+                EngineCommand::SetGain { target: *target, db }
+            }
+            MacroAction::FxMute { fx, value } => {
+                let cur = self.fx_state(*fx)?;
+                EngineCommand::SetFx { fx: FxState { mute: value.resolve(cur.mute), ..cur.clone() } }
+            }
+            MacroAction::VbanSend { bus: id, value } => {
+                let b = bus(*id)?;
+                EngineCommand::SetBusVban {
+                    bus: *id,
+                    config: VbanSend { enabled: value.resolve(b.vban.enabled), ..b.vban.clone() },
+                }
+            }
+            MacroAction::DefaultOutput { value } => {
+                EngineCommand::SetDefaultOutput { on: value.resolve(self.app.take_default_output) }
+            }
+        })
     }
 
     fn make_bus_tap(&mut self, b: &BusState) -> Option<MeterTap> {
@@ -1117,6 +1211,8 @@ impl Engine {
                 self.dirty = true;
             }
             EngineCommand::SetFx { fx } => self.set_fx(fx),
+            EngineCommand::SetMacros { macros } => self.set_macros(macros),
+            EngineCommand::TriggerMacro { id, pressed } => self.trigger_macro(id, pressed),
             EngineCommand::SetFxRoute { fx, bus, on } => self.set_fx_route(fx, bus, on),
             EngineCommand::SetBusEqParams { bus, params } => {
                 if let Some(b) = self.app.buses.iter_mut().find(|b| b.id == bus) {

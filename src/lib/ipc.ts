@@ -13,6 +13,7 @@ import type {
   FxState,
   GateParams,
   LimiterParams,
+  MacroButton,
   MeterFrame,
   PanParams,
   VbanRecv,
@@ -37,6 +38,10 @@ export interface Ipc {
   /** Return level, mute and settings; `routes` is ignored (use setFxRoute). */
   setFx(fx: FxState): Promise<void>;
   setFxRoute(fx: FxKind, bus: BusId, on: boolean): Promise<void>;
+  /** Replace all macro buttons (from the editor). */
+  setMacros(macros: MacroButton[]): Promise<void>;
+  /** A macro button went down (pressed) or up. */
+  triggerMacro(id: number, pressed: boolean): Promise<void>;
   setLimiterParams(bus: BusId, params: LimiterParams): Promise<void>;
   setStripDevice(stripId: number, hwKey: string): Promise<void>;
   setBusTarget(bus: BusId, hwKey: string): Promise<void>;
@@ -86,6 +91,8 @@ function tauriIpc(): Ipc {
     setSends: (stripId, sends) => invoke("set_sends", { stripId, sends }),
     setFx: (fx) => invoke("set_fx", { fx }),
     setFxRoute: (fx, bus, on) => invoke("set_fx_route", { fx, bus, on }),
+    setMacros: (macros) => invoke("set_macros", { macros }),
+    triggerMacro: (id, pressed) => invoke("trigger_macro", { id, pressed }),
     setLimiterParams: (bus, params) => invoke("set_limiter_params", { bus, params }),
     setStripDevice: (stripId, hwKey) => invoke("set_strip_device", { stripId, hwKey }),
     setBusTarget: (bus, hwKey) => invoke("set_bus_target", { bus, hwKey }),

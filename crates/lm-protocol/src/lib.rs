@@ -373,6 +373,97 @@ impl FxState {
     }
 }
 
+// ---- macro buttons -----------------------------------------------------------
+
+/// Upper bound on macro buttons.
+pub const MAX_MACROS: usize = 24;
+/// Upper bound on actions in one list.
+pub const MAX_MACRO_ACTIONS: usize = 32;
+
+/// What a boolean action does to its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Switch {
+    On,
+    Off,
+    Toggle,
+}
+
+impl Switch {
+    pub fn resolve(self, current: bool) -> bool {
+        match self {
+            Switch::On => true,
+            Switch::Off => false,
+            Switch::Toggle => !current,
+        }
+    }
+}
+
+/// One thing a macro button does. Actions naming a strip or bus that no
+/// longer exists are skipped.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MacroAction {
+    /// Mute a strip or bus.
+    Mute { target: Target, value: Switch },
+    Solo { strip: StripId, value: Switch },
+    Route { strip: StripId, bus: BusId, value: Switch },
+    /// Set a strip or bus fader, in dB.
+    Gain { target: Target, db: f32 },
+    /// Mute an effect's return.
+    FxMute { fx: FxKind, value: Switch },
+    /// Start or stop a bus's VBAN stream (only if its config is valid).
+    VbanSend { bus: BusId, value: Switch },
+    /// linuxmeeter as the system default output.
+    DefaultOutput { value: Switch },
+}
+
+/// How a macro button responds to presses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MacroMode {
+    /// Each press flips the button: on, then off.
+    Toggle,
+    /// On while held (push-to-talk style), off on release.
+    Push,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MacroButton {
+    pub id: u32,
+    pub label: String,
+    pub mode: MacroMode,
+    /// Run when the button turns on (toggle) or is pressed (push).
+    #[serde(default)]
+    pub on: Vec<MacroAction>,
+    /// Run when the button turns off (toggle) or is released (push).
+    #[serde(default)]
+    pub off: Vec<MacroAction>,
+    /// In-window keyboard shortcut, e.g. "F1" or "Ctrl+M".
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Lit. Saved for toggle buttons; push buttons always start off.
+    #[serde(default)]
+    pub active: bool,
+}
+
+impl MacroButton {
+    /// Normalize a button from the editor or a profile: a usable label,
+    /// bounded action lists, a trimmed shortcut, push buttons not left on.
+    pub fn validated(&self) -> Self {
+        let mut b = self.clone();
+        b.label = clean_label(&b.label).unwrap_or_else(|| format!("Macro {}", b.id));
+        b.on.truncate(MAX_MACRO_ACTIONS);
+        b.off.truncate(MAX_MACRO_ACTIONS);
+        b.key = b.key.as_deref().map(str::trim).filter(|k| !k.is_empty()).map(String::from);
+        if b.mode == MacroMode::Push {
+            b.active = false;
+        }
+        b
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LimiterParams {
@@ -624,6 +715,8 @@ pub struct AppState {
     /// The shared effects, one per [`FxKind`], in `FxKind::ALL` order.
     #[serde(default = "FxState::defaults")]
     pub fx: Vec<FxState>,
+    #[serde(default)]
+    pub macros: Vec<MacroButton>,
 }
 
 /// One batched meter update, ~30/s. Channel layout: [peakL, peakR, rmsL, rmsR]
@@ -662,6 +755,11 @@ pub enum EngineCommand {
     SetFx { fx: FxState },
     /// Route an effect's return to a bus.
     SetFxRoute { fx: FxKind, bus: BusId, on: bool },
+    /// Replace the macro buttons (from the editor). Lit states the editor
+    /// sends are kept for toggle buttons.
+    SetMacros { macros: Vec<MacroButton> },
+    /// A macro button went down (`pressed: true`) or up.
+    TriggerMacro { id: u32, pressed: bool },
     SetLimiterParams { bus: BusId, params: LimiterParams },
     SetBusEqParams { bus: BusId, params: EqParams },
     /// Point a hardware strip at a different capture device (module reload).
@@ -822,6 +920,7 @@ mod tests {
             profile_name: "Default".into(),
             take_default_output: true,
             fx: FxState::defaults(),
+            macros: vec![],
         })
         .expect("serialize");
 
@@ -894,6 +993,18 @@ mod tests {
             EngineCommand::SetSends { strip: 1, sends: FxSends { reverb: 0.3, echo: 0.0 } },
             EngineCommand::SetFx { fx: FxState::default_for(FxKind::Reverb) },
             EngineCommand::SetFxRoute { fx: FxKind::Echo, bus: BusId::B1, on: true },
+            EngineCommand::SetMacros {
+                macros: vec![MacroButton {
+                    id: 1,
+                    label: "Talk".into(),
+                    mode: MacroMode::Push,
+                    on: vec![MacroAction::Mute { target: Target::Strip { strip: 1 }, value: Switch::Off }],
+                    off: vec![MacroAction::Mute { target: Target::Strip { strip: 1 }, value: Switch::On }],
+                    key: Some("F1".into()),
+                    active: false,
+                }],
+            },
+            EngineCommand::TriggerMacro { id: 1, pressed: true },
             EngineCommand::SetBusEqParams { bus: BusId::B2, params: EqParams::bus_default() },
             EngineCommand::SetPanParams { strip: 2, params: PanParams { mono: true, ..Default::default() } },
             EngineCommand::RemoveBus { bus: BusId::A4 },
@@ -971,6 +1082,58 @@ mod tests {
         assert_eq!(clean_label(&"x".repeat(50)).map(|s| s.len()), Some(LABEL_MAX));
         assert_eq!(clean_label("   "), None);
         assert_eq!(clean_label("Café ♪").as_deref(), Some("Café ♪"), "labels may be any printable text");
+    }
+
+    // ---- macro buttons -----------------------------------------------------
+
+    #[test]
+    fn switch_resolves_against_the_current_state() {
+        assert!(Switch::On.resolve(false) && Switch::On.resolve(true));
+        assert!(!Switch::Off.resolve(true));
+        assert!(Switch::Toggle.resolve(false) && !Switch::Toggle.resolve(true));
+    }
+
+    /// The wire format the editor writes: actions are internally tagged.
+    #[test]
+    fn macro_actions_are_tagged_on_the_wire() {
+        let a = MacroAction::Route { strip: 3, bus: BusId::B1, value: Switch::Toggle };
+        assert_eq!(serde_json::to_value(&a).unwrap(), serde_json::json!({ "type": "route", "strip": 3, "bus": "B1", "value": "toggle" }));
+        let g: MacroAction = serde_json::from_value(serde_json::json!({ "type": "gain", "target": { "bus": "A1" }, "db": -10.0 })).unwrap();
+        assert_eq!(g, MacroAction::Gain { target: Target::Bus { bus: BusId::A1 }, db: -10.0 });
+        let m: MacroAction = serde_json::from_value(serde_json::json!({ "type": "fx_mute", "fx": "echo", "value": "on" })).unwrap();
+        assert_eq!(m, MacroAction::FxMute { fx: FxKind::Echo, value: Switch::On });
+    }
+
+    #[test]
+    fn macro_buttons_are_normalized() {
+        let b = MacroButton {
+            id: 7,
+            label: "   ".into(),
+            mode: MacroMode::Push,
+            on: vec![MacroAction::DefaultOutput { value: Switch::On }; 50],
+            off: vec![],
+            key: Some("  ".into()),
+            active: true,
+        }
+        .validated();
+        assert_eq!(b.label, "Macro 7");
+        assert_eq!(b.on.len(), MAX_MACRO_ACTIONS);
+        assert_eq!(b.key, None);
+        assert!(!b.active, "a push button never starts held");
+        let t = MacroButton { mode: MacroMode::Toggle, active: true, key: Some(" F2 ".into()), ..b }.validated();
+        assert!(t.active, "a toggle button keeps its state");
+        assert_eq!(t.key.as_deref(), Some("F2"));
+    }
+
+    #[test]
+    fn macro_buttons_are_optional_in_saved_state() {
+        let s: AppState = serde_json::from_value(serde_json::json!({
+            "strips": [], "buses": [], "devices": [], "profileName": "x", "takeDefaultOutput": false
+        }))
+        .unwrap();
+        assert!(s.macros.is_empty());
+        let b: MacroButton = serde_json::from_value(serde_json::json!({ "id": 1, "label": "Talk", "mode": "push" })).unwrap();
+        assert!(b.on.is_empty() && b.off.is_empty() && b.key.is_none() && !b.active);
     }
 
     // ---- effects -----------------------------------------------------------

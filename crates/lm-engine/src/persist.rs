@@ -20,6 +20,8 @@ pub struct Profile {
     /// Echo / reverb settings; absent from profiles that predate them.
     #[serde(default = "lm_protocol::FxState::defaults")]
     pub fx: Vec<lm_protocol::FxState>,
+    #[serde(default)]
+    pub macros: Vec<lm_protocol::MacroButton>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +112,13 @@ fn sanitize(p: &mut Profile) {
     // Strip ids key node names; a duplicate would fight over one node.
     let mut seen = std::collections::HashSet::new();
     p.strips.retain(|s| seen.insert(s.id));
+    // Macros: unique ids, bounded count, each one normalized.
+    let mut ids = std::collections::HashSet::new();
+    p.macros.retain(|m| ids.insert(m.id));
+    p.macros.truncate(lm_protocol::MAX_MACROS);
+    for m in &mut p.macros {
+        *m = m.validated();
+    }
     // Exactly one of each effect, in FxKind::ALL order, settings in range.
     p.fx = lm_protocol::FxKind::ALL
         .into_iter()
@@ -176,6 +185,7 @@ mod tests {
                 vban: Default::default(),
             }],
             fx: lm_protocol::FxState::defaults(),
+            macros: vec![],
         }
     }
 
@@ -368,6 +378,27 @@ releaseMs = 50.0
         let ids: Vec<BusId> = p.buses.iter().map(|b| b.id).collect();
         assert_eq!(ids, [BusId::A1, BusId::A4, BusId::B1, BusId::B3]);
         assert_eq!(p.strips.len(), 1, "a duplicate strip id would fight over one node name");
+    }
+
+    #[test]
+    fn macros_survive_a_round_trip_and_are_normalized_on_load() {
+        use lm_protocol::{MacroAction, MacroButton, MacroMode, Switch, Target};
+        let mut p = profile(vec![strip(1, StripKind::Virtual)]);
+        let talk = MacroButton {
+            id: 1,
+            label: "Talk".into(),
+            mode: MacroMode::Push,
+            on: vec![MacroAction::Mute { target: Target::Strip { strip: 1 }, value: Switch::Off }],
+            off: vec![MacroAction::Mute { target: Target::Strip { strip: 1 }, value: Switch::On }],
+            key: Some("F1".into()),
+            active: true,
+        };
+        p.macros = vec![talk.clone(), MacroButton { label: "dupe".into(), ..talk.clone() }];
+        let mut back: Profile = toml::from_str(&toml::to_string_pretty(&p).unwrap()).unwrap();
+        assert_eq!(back.macros[0].on, talk.on);
+        sanitize(&mut back);
+        assert_eq!(back.macros.len(), 1, "duplicate ids are dropped");
+        assert!(!back.macros[0].active, "a push button never starts held");
     }
 
     /// Effects: missing kinds come back with defaults, duplicates go, order is

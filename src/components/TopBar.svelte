@@ -73,6 +73,15 @@
     >
       FX
     </button>
+    <button
+      class="toggle"
+      class:active={ui.macroBar}
+      aria-pressed={ui.macroBar}
+      title="Show or hide the macro buttons"
+      onclick={() => (ui.macroBar = !ui.macroBar)}
+    >
+      MACROS
+    </button>
   </div>
   <button class="iconbtn" title="Settings">
     <svg width="14" height="14" viewBox="0 0 16 16" fill="none">

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use lm_protocol::{
     AppState, BusId, CompParams, EngineCommand, EngineEvent, EqParams, FxKind, FxSends, FxState, GateParams,
-    LimiterParams, PanParams, StripId, StripKind, Target, VbanRecv, VbanSend,
+    LimiterParams, MacroButton, PanParams, StripId, StripKind, Target, VbanRecv, VbanSend,
 };
 use tauri::{Emitter, Manager};
 
@@ -83,6 +83,16 @@ fn set_fx(data: tauri::State<AppData>, fx: FxState) -> Result<(), String> {
 #[tauri::command]
 fn set_fx_route(data: tauri::State<AppData>, fx: FxKind, bus: BusId, on: bool) -> Result<(), String> {
     send(&data, EngineCommand::SetFxRoute { fx, bus, on })
+}
+
+#[tauri::command]
+fn set_macros(data: tauri::State<AppData>, macros: Vec<MacroButton>) -> Result<(), String> {
+    send(&data, EngineCommand::SetMacros { macros })
+}
+
+#[tauri::command]
+fn trigger_macro(data: tauri::State<AppData>, id: u32, pressed: bool) -> Result<(), String> {
+    send(&data, EngineCommand::TriggerMacro { id, pressed })
 }
 
 #[tauri::command]
@@ -227,6 +237,8 @@ fn main() {
             set_sends,
             set_fx,
             set_fx_route,
+            set_macros,
+            trigger_macro,
             set_limiter_params,
             set_strip_device,
             set_bus_target,

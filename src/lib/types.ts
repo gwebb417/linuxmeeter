@@ -95,6 +95,33 @@ export const BUS_EQ_BANDS: EqBand[] = [
   { kind: "high_shelf", freqHz: 12000, gainDb: 0, q: 0.7 },
 ];
 
+/** Macro buttons (mirror lm_protocol's macro types). */
+export const MAX_MACROS = 24;
+export const MAX_MACRO_ACTIONS = 32;
+export type Switch = "on" | "off" | "toggle";
+export type MacroMode = "toggle" | "push";
+export type MacroAction =
+  | { type: "mute"; target: { strip: number } | { bus: BusId }; value: Switch }
+  | { type: "solo"; strip: number; value: Switch }
+  | { type: "route"; strip: number; bus: BusId; value: Switch }
+  | { type: "gain"; target: { strip: number } | { bus: BusId }; db: number }
+  | { type: "fx_mute"; fx: FxKind; value: Switch }
+  | { type: "vban_send"; bus: BusId; value: Switch }
+  | { type: "default_output"; value: Switch };
+
+export interface MacroButton {
+  id: number;
+  label: string;
+  mode: MacroMode;
+  /** Run on turning on (toggle) / on press (push). */
+  on: MacroAction[];
+  /** Run on turning off (toggle) / on release (push). */
+  off: MacroAction[];
+  /** In-window shortcut, e.g. "F1" or "Ctrl+M". */
+  key: string | null;
+  active: boolean;
+}
+
 /** The shared effects (mirrors lm_protocol::FxKind). */
 export type FxKind = "reverb" | "echo";
 export const FX_KINDS: FxKind[] = ["reverb", "echo"];
@@ -195,6 +222,7 @@ export interface AppState {
   takeDefaultOutput: boolean;
   /** Reverb then echo. */
   fx: FxState[];
+  macros: MacroButton[];
 }
 
 /** One batched meter update, ~30/s. Channel layout: [peakL, peakR, rmsL, rmsR] in dBFS. */

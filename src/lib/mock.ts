@@ -4,7 +4,7 @@
  * meters actually respond when you pull a fader or punch a route button —
  * design iteration feels like the real app.
  */
-import type { AppState, BusId, MeterFrame, StripState, VbanRecv, VbanSend } from "./types";
+import type { AppState, BusId, MacroAction, MacroButton, MeterFrame, StripState, Switch, VbanRecv, VbanSend } from "./types";
 import {
   BUS_EQ_BANDS,
   BUS_IDS,
@@ -12,6 +12,8 @@ import {
   ECHO_FEEDBACK_MAX,
   FX_KINDS,
   LABEL_MAX,
+  MAX_MACRO_ACTIONS,
+  MAX_MACROS,
   MAX_STRIPS,
   REVERB_DECAY_MS,
   VBAN_DEFAULT_PORT,
@@ -99,6 +101,62 @@ const routes = (on: BusId[]): Partial<Record<BusId, boolean>> =>
  *  structuredClone would throw on the Svelte state proxies inside. */
 const plain = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
 
+/** Mirrors lm_protocol::MacroButton::validated. */
+function validMacro(m: MacroButton): MacroButton {
+  const key = m.key?.trim() || null;
+  return {
+    ...plain(m),
+    label: cleanLabel(m.label) ?? `Macro ${m.id}`,
+    on: plain(m.on).slice(0, MAX_MACRO_ACTIONS),
+    off: plain(m.off).slice(0, MAX_MACRO_ACTIONS),
+    key,
+    active: m.mode === "push" ? false : m.active,
+  };
+}
+
+const resolve = (v: Switch, cur: boolean): boolean => (v === "toggle" ? !cur : v === "on");
+
+/** Mirrors Engine::macro_command + handle: run one action against the mock state. */
+function runAction(a: MacroAction): void {
+  const target = (t: { strip: number } | { bus: BusId }) =>
+    "strip" in t ? findStrip(t.strip) : state.buses.find((b) => b.id === t.bus);
+  switch (a.type) {
+    case "mute": {
+      const o = target(a.target);
+      if (o) o.mute = resolve(a.value, o.mute);
+      break;
+    }
+    case "solo": {
+      const s = findStrip(a.strip);
+      if (s) s.solo = resolve(a.value, s.solo);
+      break;
+    }
+    case "route": {
+      const s = findStrip(a.strip);
+      if (s && state.buses.some((b) => b.id === a.bus)) s.routes[a.bus] = resolve(a.value, !!s.routes[a.bus]);
+      break;
+    }
+    case "gain": {
+      const o = target(a.target);
+      if (o && Number.isFinite(a.db)) o.gainDb = Math.max(-80, Math.min(12, a.db));
+      break;
+    }
+    case "fx_mute": {
+      const f = state.fx.find((x) => x.kind === a.fx);
+      if (f) f.mute = resolve(a.value, f.mute);
+      break;
+    }
+    case "vban_send": {
+      const b = state.buses.find((x) => x.id === a.bus);
+      if (b) b.vban = { ...b.vban, enabled: resolve(a.value, b.vban.enabled) };
+      break;
+    }
+    case "default_output":
+      state.takeDefaultOutput = resolve(a.value, state.takeDefaultOutput);
+      break;
+  }
+}
+
 /** Mirrors lm_protocol::clean_label. */
 function cleanLabel(raw: string): string | null {
   // eslint-disable-next-line no-control-regex
@@ -110,6 +168,7 @@ const state: AppState = {
   profileName: "Default",
   takeDefaultOutput: false,
   fx: FX_KINDS.map(defaultFx),
+  macros: [],
   strips: [
     { id: 1, kind: "hardware", label: "Mic", hwKey: "alsa_input.usb-ZOOM_Corporation_UAC-2", online: true, gainDb: -4, mute: false, solo: false, routes: routes(["A2", "B1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), pan: defaultPan(), sends: defaultSends(), vban: null },
     { id: 2, kind: "hardware", label: "Line In", hwKey: "alsa_input.pci-0000_31_00.4.analog-stereo", online: true, gainDb: -12, mute: false, solo: false, routes: routes(["A1"]), gate: defaultGate(), comp: defaultComp(), eq: defaultEq(), pan: defaultPan(), sends: defaultSends(), vban: null },
@@ -273,6 +332,33 @@ export const mockIpc: Ipc = {
   setPanParams: (stripId, params) => {
     const s = findStrip(stripId);
     if (s) s.pan = { ...params, balance: Math.max(-1, Math.min(1, params.balance)) };
+    return Promise.resolve();
+  },
+  setMacros: (macros) => {
+    const seen = new Set<number>();
+    state.macros = macros
+      .filter((m) => !seen.has(m.id) && (seen.add(m.id), true))
+      .map(validMacro)
+      .slice(0, MAX_MACROS);
+    broadcast();
+    return Promise.resolve();
+  },
+  triggerMacro: (id, pressed) => {
+    const m = state.macros.find((x) => x.id === id);
+    if (!m) return Promise.resolve();
+    let run: MacroAction[] | null = null;
+    if (m.mode === "toggle" && pressed) {
+      m.active = !m.active;
+      run = m.active ? m.on : m.off;
+    } else if (m.mode === "push" && pressed && !m.active) {
+      m.active = true;
+      run = m.on;
+    } else if (m.mode === "push" && !pressed && m.active) {
+      m.active = false;
+      run = m.off;
+    }
+    for (const a of run ?? []) runAction(a);
+    broadcast();
     return Promise.resolve();
   },
   setSends: (stripId, sends) => {

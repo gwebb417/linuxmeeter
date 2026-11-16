@@ -16,6 +16,7 @@ import type {
   FxState,
   GateParams,
   LimiterParams,
+  MacroButton,
   PanParams,
   StripState,
   VbanRecv,
@@ -31,6 +32,7 @@ class MixerStore {
   profileName = $state("Default");
   takeDefaultOutput = $state(false);
   fx = $state<FxState[]>([]);
+  macros = $state<MacroButton[]>([]);
   ready = $state(false);
   error = $state<string | null>(null);
   /** Last rejected command from the engine (shown briefly, then cleared). */
@@ -98,6 +100,7 @@ class MixerStore {
     this.profileName = s.profileName;
     this.takeDefaultOutput = s.takeDefaultOutput;
     this.fx = s.fx ?? [];
+    this.macros = s.macros ?? [];
   }
 
   #find(t: Target): StripState | BusState | undefined {
@@ -177,6 +180,16 @@ class MixerStore {
     const s = this.strip(stripId);
     if (s) s.pan = params;
     void ipc.setPanParams(stripId, params);
+  }
+
+  /** Not optimistic: the engine normalizes the list and sends it back. */
+  setMacros(macros: MacroButton[]): void {
+    void ipc.setMacros(macros);
+  }
+
+  /** The engine decides what a press does (toggle vs push) and resends state. */
+  triggerMacro(id: number, pressed: boolean): void {
+    void ipc.triggerMacro(id, pressed);
   }
 
   setSends(stripId: number, sends: FxSends): void {

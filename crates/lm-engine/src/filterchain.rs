@@ -4,7 +4,8 @@
 //! Modules are loaded in-process so every virtual device dies with the app —
 //! `pw-dump` must show zero `lm.*` nodes after exit.
 
-use std::ffi::CString;
+use std::cell::Cell;
+use std::ffi::{c_void, CString};
 use std::ptr::NonNull;
 
 use pipewire::context::ContextRc;
@@ -23,12 +24,47 @@ pub enum ModuleError {
 ///
 /// Must be dropped before the [`ContextRc`] it was loaded into; holding a
 /// clone of the context here guarantees that ordering.
+///
+/// A module can also unload *itself*: filter-chain schedules its own destroy
+/// when one of its streams becomes unconnected (e.g. its node was destroyed),
+/// or its daemon connection fails or goes away. `watch` hears about that, so
+/// dropping a module that's already gone doesn't free it a second time.
 pub struct LoadedModule {
     ptr: NonNull<pipewire::sys::pw_impl_module>,
+    // Boxed so the registered spa_hook never moves.
+    watch: Box<ModuleWatch>,
     _context: ContextRc,
 }
 
+struct ModuleWatch {
+    hook: libspa::sys::spa_hook,
+    destroyed: Cell<bool>,
+}
+
+static MODULE_EVENTS: pipewire::sys::pw_impl_module_events = pipewire::sys::pw_impl_module_events {
+    version: pipewire::sys::PW_VERSION_IMPL_MODULE_EVENTS,
+    destroy: Some(on_module_destroy),
+    free: None,
+    initialized: None,
+    registered: None,
+};
+
+unsafe extern "C" fn on_module_destroy(data: *mut c_void) {
+    // SAFETY: data is the ModuleWatch registered in `load`; it lives in a Box
+    // owned by the LoadedModule, which outlives the module (Drop destroys the
+    // module before the Box is freed).
+    let watch = unsafe { &*(data as *const ModuleWatch) };
+    watch.destroyed.set(true);
+    // The module clears its listener list right after this event, so the hook
+    // needs no explicit removal.
+}
+
 impl LoadedModule {
+    /// False once the module has unloaded itself; its nodes are gone too.
+    pub fn is_loaded(&self) -> bool {
+        !self.watch.destroyed.get()
+    }
+
     pub fn load(context: &ContextRc, name: &str, args: &str) -> Result<Self, ModuleError> {
         let cname = CString::new(name)?;
         let cargs = CString::new(args)?;
@@ -42,17 +78,39 @@ impl LoadedModule {
                 std::ptr::null_mut(),
             )
         };
-        match NonNull::new(ptr) {
-            Some(ptr) => Ok(Self { ptr, _context: context.clone() }),
-            None => Err(ModuleError::LoadFailed(std::io::Error::last_os_error())),
+        let Some(ptr) = NonNull::new(ptr) else {
+            return Err(ModuleError::LoadFailed(std::io::Error::last_os_error()));
+        };
+        let mut watch = Box::new(ModuleWatch {
+            // SAFETY: an all-zero spa_hook is the unlinked state spa_hook_list
+            // expects to initialise.
+            hook: unsafe { std::mem::zeroed() },
+            destroyed: Cell::new(false),
+        });
+        // SAFETY: the module is alive (just loaded); the hook and its data are
+        // heap-pinned in `watch`, which lives as long as this LoadedModule.
+        unsafe {
+            pipewire::sys::pw_impl_module_add_listener(
+                ptr.as_ptr(),
+                &mut watch.hook,
+                &MODULE_EVENTS,
+                &*watch as *const ModuleWatch as *mut c_void,
+            );
         }
+        Ok(Self { ptr, watch, _context: context.clone() })
     }
 }
 
 impl Drop for LoadedModule {
     fn drop(&mut self) {
-        // SAFETY: ptr came from pw_context_load_module and the context is
-        // still alive (we hold an Rc on it).
+        if self.watch.destroyed.get() {
+            // It unloaded itself; the pointer is already freed.
+            return;
+        }
+        // SAFETY: ptr came from pw_context_load_module, the module hasn't been
+        // destroyed (the watch would have said so), and the context is still
+        // alive (we hold an Rc on it). Our destroy listener fires during this
+        // call while `watch` is still allocated.
         unsafe { pipewire::sys::pw_impl_module_destroy(self.ptr.as_ptr()) };
     }
 }

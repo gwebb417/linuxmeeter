@@ -47,6 +47,14 @@ context.objects = [
         node.name        = "alsa_output.lm-test-sink"
         node.description = "linuxmeeter test sink"
         media.class      = Audio/Sink
+        # A fully fixed format, not just a channel map. PipeWire 1.4.x's
+        # audioadapter parses the follower's EnumFormat *before* fixating it,
+        # so a choice (the null sink's default format/rate ranges) parses as 0
+        # and audioconvert rejects the resulting PortConfig with -EINVAL: the
+        # sink silently stays in convert mode with one unnamed port.
+        audio.format     = F32P
+        audio.rate       = 48000
+        audio.channels   = 2
         audio.position   = [ FL FR ]
         object.linger    = true
         # No session manager here, so the adapter must configure its own ports.
@@ -61,20 +69,14 @@ context.objects = [
 ]
 EOF
 
-# Client-side counterpart: every stream this process creates (the filter-chain
-# modules' capture/playback streams, meter taps, the test tone) also needs to
-# configure its own ports, for the same reason.
-for conf in client.conf.d client-rt.conf.d; do
-    mkdir -p "$DIR/config/pipewire/$conf"
-    cat > "$DIR/config/pipewire/$conf/10-linuxmeeter-test.conf" <<'EOF'
-stream.properties = {
-    adapter.auto-port-config = { mode = dsp, monitor = false, control = false, position = preserve }
-}
-filter.properties = {
-    adapter.auto-port-config = { mode = dsp, monitor = false, control = false, position = preserve }
-}
-EOF
-done
+# Client streams (filter-chain capture/playback, meter taps, the test tone)
+# can't use the same trick: filter-chain never puts a rate in its EnumFormat,
+# so a client-side adapter.auto-port-config fails for it exactly as above and
+# its nodes come up with no ports at all. Instead the test rig plays session
+# manager for its own lm.* nodes and sets a full DSP PortConfig on each as it
+# appears. This tells it to; against a real session (which already does that
+# job) it stays unset and the rig keeps out of the way.
+export LM_TEST_NO_SESSION_MANAGER=1
 
 XDG_RUNTIME_DIR="$DIR/run" XDG_CONFIG_HOME="$DIR/config" PIPEWIRE_CORE=lm-test \
     pipewire </dev/null >"$DIR/daemon.log" 2>&1 &

@@ -6,9 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A VoiceMeeter-style virtual audio mixer for Linux: Tauri 2 shell + Svelte 5 frontend +
 a Rust PipeWire engine. Input strips (hardware capture or virtual sinks apps play into)
-run gate → comp → EQ, feed a routing matrix, and land on four buses (A1/A2 → hardware
-sinks, B1/B2 → virtual microphones). DSP is the LSP LV2 plugins hosted inside
-`libpipewire-module-filter-chain`.
+run gate → comp → EQ, feed a routing matrix, and land on buses (up to A1–A5 → hardware
+sinks, B1–B3 → virtual microphones; a profile holds any subset, always in that order).
+Strips and buses are added/removed/renamed at runtime; `strip_taps` / `bus_taps` stay
+index-aligned with `app.strips` / `app.buses` because meter frames are positional.
+DSP is the LSP LV2 plugins hosted inside `libpipewire-module-filter-chain`.
 
 ## Commands
 

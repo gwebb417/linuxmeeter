@@ -93,6 +93,13 @@ fn sanitize(p: &mut Profile) {
     for b in &mut p.buses {
         b.online = true;
     }
+    // Buses display (and meter) in A1..A5, B1..B3 order; a hand-edited
+    // profile may list them in any order, or twice.
+    p.buses.sort_by_key(|b| b.id);
+    p.buses.dedup_by_key(|b| b.id);
+    // Strip ids key node names; a duplicate would fight over one node.
+    let mut seen = std::collections::HashSet::new();
+    p.strips.retain(|s| seen.insert(s.id));
 }
 
 fn atomic_write(path: &std::path::Path, contents: &str) -> io::Result<()> {
@@ -322,6 +329,34 @@ releaseMs = 50.0
         sanitize(&mut p);
         assert!(!p.strips[0].online);
         assert_eq!(p.strips[0].vban, Some(Default::default()));
+    }
+
+    /// Meters and the rack follow bus order, so a hand-edited profile that
+    /// lists buses out of order (or twice) is put back in A1..B3 order.
+    #[test]
+    fn sanitize_orders_and_dedupes_buses() {
+        let mut p = profile(vec![strip(1, StripKind::Virtual), strip(1, StripKind::Virtual)]);
+        let a1 = p.buses[0].clone();
+        let mk = |id| BusState { id, ..a1.clone() };
+        p.buses = vec![mk(BusId::B3), mk(BusId::A4), a1.clone(), mk(BusId::A4), mk(BusId::B1)];
+        sanitize(&mut p);
+        let ids: Vec<BusId> = p.buses.iter().map(|b| b.id).collect();
+        assert_eq!(ids, [BusId::A1, BusId::A4, BusId::B1, BusId::B3]);
+        assert_eq!(p.strips.len(), 1, "a duplicate strip id would fight over one node name");
+    }
+
+    /// A profile with extra buses keeps them, routes included.
+    #[test]
+    fn extra_buses_survive_a_toml_round_trip() {
+        let mut p = profile(vec![strip(1, StripKind::Virtual)]);
+        let a1 = p.buses[0].clone();
+        p.buses.push(BusState { id: BusId::A5, label: "Stream PC".into(), ..a1.clone() });
+        p.buses.push(BusState { id: BusId::B3, label: "Discord".into(), target_hw_key: None, ..a1 });
+        p.strips[0].routes.insert(BusId::B3, true);
+        let back: Profile = toml::from_str(&toml::to_string_pretty(&p).unwrap()).unwrap();
+        assert_eq!(back.buses.iter().map(|b| b.id).collect::<Vec<_>>(), [BusId::A1, BusId::A5, BusId::B3]);
+        assert_eq!(back.buses[2].label, "Discord");
+        assert_eq!(back.strips[0].routes[&BusId::B3], true);
     }
 
     #[test]

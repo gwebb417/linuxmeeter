@@ -39,6 +39,8 @@
     {deviceOptions}
     deviceDisabled={strip.kind !== "hardware"}
     ondevicechange={(v) => mixer.setStripDevice(strip.id, v)}
+    onrename={(label) => mixer.setLabel({ strip: strip.id }, label)}
+    onremove={() => mixer.removeStrip(strip.id)}
   />
 
   <div class="mf">
@@ -100,7 +102,11 @@
   <ColorPad {strip} />
 
   <div class="sep"></div>
-  <RoutingToggleGroup routes={strip.routes} ontoggle={(bus, on) => mixer.setRoute(strip.id, bus, on)} />
+  <RoutingToggleGroup
+    buses={mixer.buses.map((b) => b.id)}
+    routes={strip.routes}
+    ontoggle={(bus, on) => mixer.setRoute(strip.id, bus, on)}
+  />
 
   <MuteSoloButtons
     mute={strip.mute}

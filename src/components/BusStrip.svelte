@@ -36,6 +36,8 @@
     {deviceOptions}
     deviceDisabled={isVirtual}
     ondevicechange={(v) => mixer.setBusTarget(bus.id, v)}
+    onrename={(label) => mixer.setLabel({ bus: bus.id }, label)}
+    onremove={mixer.buses.length > 1 ? () => mixer.removeBus(bus.id) : undefined}
   />
 
   <div class="mf">

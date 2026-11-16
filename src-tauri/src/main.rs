@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use lm_protocol::{
     AppState, BusId, CompParams, EngineCommand, EngineEvent, EqParams, GateParams, LimiterParams,
-    StripId, Target, VbanRecv, VbanSend,
+    StripId, StripKind, Target, VbanRecv, VbanSend,
 };
 use tauri::{Emitter, Manager};
 
@@ -106,6 +106,26 @@ fn remove_strip(data: tauri::State<AppData>, strip_id: StripId) -> Result<(), St
 }
 
 #[tauri::command]
+fn add_strip(data: tauri::State<AppData>, kind: StripKind, label: String) -> Result<(), String> {
+    send(&data, EngineCommand::AddStrip { kind, label })
+}
+
+#[tauri::command]
+fn add_bus(data: tauri::State<AppData>, output: bool) -> Result<(), String> {
+    send(&data, EngineCommand::AddBus { output })
+}
+
+#[tauri::command]
+fn remove_bus(data: tauri::State<AppData>, bus: BusId) -> Result<(), String> {
+    send(&data, EngineCommand::RemoveBus { bus })
+}
+
+#[tauri::command]
+fn set_label(data: tauri::State<AppData>, target: Target, label: String) -> Result<(), String> {
+    send(&data, EngineCommand::SetLabel { target, label })
+}
+
+#[tauri::command]
 fn set_default_output(data: tauri::State<AppData>, on: bool) -> Result<(), String> {
     send(&data, EngineCommand::SetDefaultOutput { on })
 }
@@ -184,6 +204,10 @@ fn main() {
             add_vban_strip,
             set_strip_vban,
             remove_strip,
+            add_strip,
+            add_bus,
+            remove_bus,
+            set_label,
             set_default_output,
             get_autostart,
             set_autostart,

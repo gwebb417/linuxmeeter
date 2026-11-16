@@ -5,7 +5,7 @@
  * design iteration feels like the real app.
  */
 import type { AppState, BusId, MeterFrame, StripState, VbanRecv, VbanSend } from "./types";
-import { VBAN_DEFAULT_PORT, VBAN_STREAM_NAME_MAX } from "./types";
+import { BUS_IDS, LABEL_MAX, MAX_STRIPS, VBAN_DEFAULT_PORT, VBAN_STREAM_NAME_MAX, isOutputBus } from "./types";
 import type { Ipc, Target } from "./ipc";
 import { powerSum } from "./utils/db";
 
@@ -77,12 +77,15 @@ function vbanStreamName(raw: string): string {
 const IPV4 = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
 const looksLikeIp = (s: string) => IPV4.test(s) || (s.includes(":") && /^[0-9a-fA-F:.]+$/.test(s));
 
-const routes = (on: BusId[]): Record<BusId, boolean> => ({
-  A1: on.includes("A1"),
-  A2: on.includes("A2"),
-  B1: on.includes("B1"),
-  B2: on.includes("B2"),
-});
+const routes = (on: BusId[]): Partial<Record<BusId, boolean>> =>
+  Object.fromEntries(BUS_IDS.map((b) => [b, on.includes(b)]));
+
+/** Mirrors lm_protocol::clean_label. */
+function cleanLabel(raw: string): string | null {
+  // eslint-disable-next-line no-control-regex
+  const s = Array.from(raw.replace(/[\u0000-\u001f\u007f]/g, "").trim()).slice(0, LABEL_MAX).join("").trim();
+  return s || null;
+}
 
 const state: AppState = {
   profileName: "Default",
@@ -307,11 +310,71 @@ export const mockIpc: Ipc = {
   },
   removeStrip: (stripId) => {
     const idx = state.strips.findIndex((s) => s.id === stripId);
-    const s = state.strips[idx];
-    if (!s) return Promise.resolve();
-    if (s.kind !== "vban") return reject("only VBAN strips can be removed");
+    if (idx < 0) return Promise.resolve();
     state.strips.splice(idx, 1);
     sims.delete(stripId);
+    broadcast();
+    return Promise.resolve();
+  },
+  addStrip: (kind, label) => {
+    if (state.strips.length >= MAX_STRIPS) return reject(`the mixer is limited to ${MAX_STRIPS} strips`);
+    const id = Math.max(0, ...state.strips.map((s) => s.id)) + 1;
+    const n = state.strips.filter((s) => s.kind === kind).length + 1;
+    const hwKey = kind === "hardware" ? (state.devices.find((d) => d.mediaClass === "Audio/Source")?.nodeName ?? null) : null;
+    if (kind === "hardware" && !hwKey) return reject("no input device to add a hardware strip for");
+    state.strips.push({
+      id,
+      kind,
+      label: cleanLabel(label) ?? (kind === "hardware" ? `Input ${n}` : `Virtual ${n}`),
+      hwKey,
+      online: true,
+      gainDb: 0,
+      mute: false,
+      solo: false,
+      routes: routes([]),
+      gate: defaultGate(),
+      comp: defaultComp(),
+      eq: defaultEq(),
+      vban: null,
+    });
+    sims.set(id, makeSim(kind === "hardware" ? "speech" : "music", -20, 6, Math.random() * 6));
+    broadcast();
+    return Promise.resolve();
+  },
+  addBus: (output) => {
+    const id = BUS_IDS.find((b) => isOutputBus(b) === output && !state.buses.some((x) => x.id === b));
+    if (!id) return reject(output ? "all five A buses are in use" : "all three B buses are in use");
+    const targetHwKey = output ? (state.devices.find((d) => d.mediaClass === "Audio/Sink")?.nodeName ?? null) : null;
+    const bus = {
+      id,
+      label: `${output ? "Output" : "Virtual"} ${id}`,
+      targetHwKey,
+      online: true,
+      gainDb: 0,
+      mute: false,
+      limiter: defaultLimiter(),
+      vban: defaultVbanSend(id),
+    };
+    state.buses.push(bus);
+    state.buses.sort((a, b) => BUS_IDS.indexOf(a.id) - BUS_IDS.indexOf(b.id));
+    for (const s of state.strips) s.routes[id] ??= false;
+    broadcast();
+    return Promise.resolve();
+  },
+  removeBus: (bus) => {
+    if (state.buses.length === 1) return reject("the mixer needs at least one bus");
+    const idx = state.buses.findIndex((b) => b.id === bus);
+    if (idx < 0) return Promise.resolve();
+    state.buses.splice(idx, 1);
+    for (const s of state.strips) delete s.routes[bus];
+    broadcast();
+    return Promise.resolve();
+  },
+  setLabel: (t, raw) => {
+    const label = cleanLabel(raw);
+    if (!label) return reject("a label can't be empty");
+    const o = "strip" in t ? findStrip(t.strip) : state.buses.find((b) => b.id === t.bus);
+    if (o) o.label = label;
     broadcast();
     return Promise.resolve();
   },

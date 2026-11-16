@@ -12,8 +12,8 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use lm_protocol::{
-    AppState, BusId, BusState, CompParams, DeviceInfo, EngineCommand, EngineEvent, EqParams,
-    GateParams, LimiterParams, StripId, StripKind, StripState, Target, VbanRecv, VbanSend,
+    clean_label, AppState, BusId, BusState, CompParams, DeviceInfo, EngineCommand, EngineEvent, EqParams,
+    GateParams, LimiterParams, StripId, StripKind, StripState, Target, VbanRecv, VbanSend, MAX_STRIPS,
 };
 use pipewire::context::ContextRc;
 use pipewire::core::CoreRc;
@@ -69,7 +69,8 @@ struct Engine {
     /// Index-aligned with `app.strips` (None if that tap failed to create),
     /// so strips can be removed without shifting other strips' meters.
     strip_taps: Vec<Option<MeterTap>>,
-    bus_taps: Vec<MeterTap>,
+    /// Index-aligned with `app.buses`, likewise.
+    bus_taps: Vec<Option<MeterTap>>,
     /// Control-node name -> bound proxy (Props target for volume/mute/DSP).
     nodes: HashMap<String, Node>,
     /// Names we want to bind when they appear.
@@ -257,14 +258,9 @@ impl Engine {
             let tap = self.make_strip_tap(&strip);
             self.strip_taps.push(tap);
         }
-        for b in &self.app.buses {
-            match MeterTap::new(self.core.clone(), &format!("b{:?}", b.id).to_lowercase()) {
-                Ok(tap) => {
-                    self.links.set_route(&b.tap_node(), &tap.node_name.clone(), true);
-                    self.bus_taps.push(tap);
-                }
-                Err(e) => tracing::warn!("bus tap failed: {e}"),
-            }
+        for b in self.app.buses.clone() {
+            let tap = self.make_bus_tap(&b);
+            self.bus_taps.push(tap);
         }
 
         // VBAN: receivers (one per port) feeding VBAN strips, senders per bus.
@@ -343,6 +339,19 @@ impl Engine {
             }
             Err(e) => {
                 tracing::warn!("strip tap failed: {e}");
+                None
+            }
+        }
+    }
+
+    fn make_bus_tap(&mut self, b: &BusState) -> Option<MeterTap> {
+        match MeterTap::new(self.core.clone(), &format!("b{:?}", b.id).to_lowercase()) {
+            Ok(tap) => {
+                self.links.set_route(&b.tap_node(), &tap.node_name.clone(), true);
+                Some(tap)
+            }
+            Err(e) => {
+                tracing::warn!("bus tap failed: {e}");
                 None
             }
         }
@@ -522,11 +531,155 @@ impl Engine {
         self.send_state();
     }
 
+    // ---- strip / bus population -------------------------------------------
+
+    /// The strip that "Default out" makes the system output: the first virtual one.
+    fn default_output_strip(&self) -> Option<StripId> {
+        self.app.strips.iter().find(|s| s.kind == StripKind::Virtual).map(|s| s.id)
+    }
+
+    /// A real device to point a new strip or bus at: the system default when it
+    /// isn't one of our own nodes (it is while "Default out" is on), else the
+    /// first ALSA device of that class.
+    fn hardware_default(&self, class: &str) -> Option<String> {
+        let current = if class == "Audio/Sink" { &self.default_sink } else { &self.default_source };
+        current.clone().filter(|n| !n.starts_with("lm.")).or_else(|| self.first_node(class))
+    }
+
+    fn add_strip(&mut self, kind: StripKind, label: String) {
+        if self.app.strips.len() >= MAX_STRIPS {
+            return self.report(format!("the mixer is limited to {MAX_STRIPS} strips"));
+        }
+        let hw_key = match kind {
+            StripKind::Hardware => match self.hardware_default("Audio/Source") {
+                Some(k) => Some(k),
+                None => return self.report("no input device to add a hardware strip for"),
+            },
+            StripKind::Virtual => None,
+            StripKind::Vban => return self.report("network strips are added from the VBAN panel"),
+        };
+        let id = self.app.strips.iter().map(|s| s.id).max().unwrap_or(0) + 1;
+        let n = self.app.strips.iter().filter(|s| s.kind == kind).count() + 1;
+        let label = clean_label(&label).unwrap_or_else(|| match kind {
+            StripKind::Hardware => format!("Input {n}"),
+            _ => format!("Virtual {n}"),
+        });
+        let online = hw_key.as_deref().is_none_or(|k| self.model.node_by_name(k).is_some());
+        let strip = StripState {
+            id,
+            kind,
+            label,
+            hw_key,
+            online,
+            gain_db: 0.0,
+            mute: false,
+            solo: false,
+            // Nothing routed: a new input never surprises anyone's speakers or mic.
+            routes: routes(&[]),
+            gate: GateParams::default(),
+            comp: CompParams::default(),
+            eq: EqParams::default(),
+            vban: None,
+        };
+        self.app.strips.push(strip.clone());
+        self.load_strip_module(&strip);
+        let tap = self.make_strip_tap(&strip);
+        self.strip_taps.push(tap);
+        self.reconcile();
+        self.send_state();
+    }
+
+    fn add_bus(&mut self, output: bool) {
+        let free = BusId::ALL.into_iter().find(|id| id.is_output() == output && !self.app.buses.iter().any(|b| b.id == *id));
+        let Some(id) = free else {
+            return self.report(if output { "all five A buses are in use" } else { "all three B buses are in use" });
+        };
+        let target = if output {
+            match self.hardware_default("Audio/Sink") {
+                Some(t) => Some(t),
+                None => return self.report("no output device for a new A bus"),
+            }
+        } else {
+            None
+        };
+        let label = format!("{} {id:?}", if output { "Output" } else { "Virtual" });
+        let b = bus(id, &label, target);
+        // Keep A1..A5, B1..B3 order; taps stay index-aligned.
+        let idx = self.app.buses.iter().position(|x| x.id > id).unwrap_or(self.app.buses.len());
+        self.app.buses.insert(idx, b.clone());
+        for s in &mut self.app.strips {
+            s.routes.entry(id).or_insert(false);
+        }
+        self.load_bus_module(&b);
+        let tap = self.make_bus_tap(&b);
+        self.bus_taps.insert(idx, tap);
+        self.apply_bus_vban(id);
+        self.reconcile();
+        self.send_state();
+    }
+
+    fn remove_bus(&mut self, id: BusId) {
+        let Some(idx) = self.app.buses.iter().position(|b| b.id == id) else { return };
+        if self.app.buses.len() == 1 {
+            return self.report("the mixer needs at least one bus");
+        }
+        let b = self.app.buses.remove(idx);
+        let tap = self.bus_taps.remove(idx);
+        if let Some(tap) = &tap {
+            self.links.set_route(&b.tap_node(), &tap.node_name, false);
+        }
+        let outs: Vec<String> = self.app.strips.iter().map(|s| s.out_node()).collect();
+        for out in outs {
+            self.links.set_route(&out, &b.in_node(), false);
+        }
+        for s in &mut self.app.strips {
+            s.routes.remove(&id);
+        }
+        self.links.set_route(&b.tap_node(), &b.vban_node(), false);
+        self.vban_send_modules.remove(&id);
+        self.reconcile();
+        drop(tap);
+        self.nodes.remove(&b.in_node());
+        self.wanted_controls.remove(&b.in_node());
+        self.bus_modules.remove(&id);
+        self.send_state();
+    }
+
+    /// Labels are baked into node descriptions, so a rename reloads the module;
+    /// node names don't change, so routes and taps re-link by themselves.
+    fn set_label(&mut self, target: Target, label: String) {
+        let Some(label) = clean_label(&label) else {
+            return self.report("a label can't be empty");
+        };
+        match target {
+            Target::Strip { strip } => {
+                let Some(s) = self.app.strips.iter_mut().find(|s| s.id == strip) else { return };
+                if s.label == label {
+                    return;
+                }
+                s.label = label;
+                let vban_port = s.vban.as_ref().map(|v| v.port);
+                self.reload_strip(strip);
+                if let Some(port) = vban_port {
+                    self.reload_vban_port(port);
+                }
+            }
+            Target::Bus { bus } => {
+                let Some(b) = self.app.buses.iter_mut().find(|b| b.id == bus) else { return };
+                if b.label == label {
+                    return;
+                }
+                b.label = label;
+                self.reload_bus(bus);
+                self.apply_bus_vban(bus);
+            }
+        }
+        self.send_state();
+    }
+
     fn remove_strip(&mut self, id: StripId) {
         let Some(idx) = self.app.strips.iter().position(|s| s.id == id) else { return };
-        if self.app.strips[idx].kind != StripKind::Vban {
-            return self.report("only VBAN strips can be removed");
-        }
+        let was_default_output = self.app.take_default_output && self.default_output_strip() == Some(id);
         let s = self.app.strips.remove(idx);
         let tap = self.strip_taps.remove(idx);
         if let Some(tap) = &tap {
@@ -547,7 +700,32 @@ impl Engine {
         if s.solo {
             self.apply_strip_mutes();
         }
+        if was_default_output {
+            // Hand the system output to the next virtual strip, or give it back.
+            let next = self.default_output_strip().is_some();
+            self.apply_default_output(next);
+        }
         self.send_state();
+    }
+
+    /// Unload every module and tap now. The engine itself lives on in listener
+    /// closures that reference it (an Rc cycle), so dropping the main loop
+    /// would not unload anything until the process exits; shutdown must not
+    /// depend on that.
+    fn unload_all(&mut self) {
+        if self.app.take_default_output {
+            // Hand the system output back before its target disappears.
+            self.apply_default_output(false);
+        }
+        self.vban_send_modules.clear();
+        self.vban_recv_modules.clear();
+        self.strip_taps.clear();
+        self.bus_taps.clear();
+        self.nodes.clear();
+        self.wanted_controls.clear();
+        self.strip_modules.clear();
+        self.bus_modules.clear();
+        let _ = self.core.sync(0);
     }
 
     fn first_node(&self, class: &str) -> Option<String> {
@@ -809,6 +987,10 @@ impl Engine {
             EngineCommand::AddVbanStrip { label, config } => self.add_vban_strip(label, config),
             EngineCommand::SetStripVban { strip, label, config } => self.set_strip_vban(strip, label, config),
             EngineCommand::RemoveStrip { strip } => self.remove_strip(strip),
+            EngineCommand::AddStrip { kind, label } => self.add_strip(kind, label),
+            EngineCommand::AddBus { output } => self.add_bus(output),
+            EngineCommand::RemoveBus { bus } => self.remove_bus(bus),
+            EngineCommand::SetLabel { target, label } => self.set_label(target, label),
             EngineCommand::SetDefaultOutput { on } => {
                 self.apply_default_output(on);
                 self.send_state();
@@ -876,7 +1058,7 @@ impl Engine {
                 .iter()
                 .map(|t| t.as_ref().map_or([-90.0; 4], |t| t.accum.drain()))
                 .collect(),
-            buses: self.bus_taps.iter().map(|t| t.accum.drain()).collect(),
+            buses: self.bus_taps.iter().map(|t| t.as_ref().map_or([-90.0; 4], |t| t.accum.drain())).collect(),
         }
     }
 }
@@ -1090,7 +1272,9 @@ fn run(
         let ml = mainloop.clone();
         cmd_rx.attach(mainloop.loop_(), move |cmd| {
             if matches!(cmd, EngineCommand::Shutdown) {
-                engine.borrow_mut().save_now();
+                let mut e = engine.borrow_mut();
+                e.save_now();
+                e.unload_all();
                 ml.quit();
                 return;
             }
@@ -1130,6 +1314,12 @@ fn run(
 
     tracing::info!("engine running");
     mainloop.run();
+    // Shutdown unloaded everything just before quitting; spin the loop a few
+    // more times so those disconnects reach the daemon even if the process
+    // lingers (the Tauri shell exits ~200 ms later, a test harness may not).
+    for _ in 0..5 {
+        mainloop.loop_().iterate(pipewire::loop_::Timeout::Finite(Duration::from_millis(20)));
+    }
     tracing::info!("engine stopped");
     Ok(())
 }

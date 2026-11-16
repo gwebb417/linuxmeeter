@@ -34,8 +34,13 @@ export interface Ipc {
   /** The new strip arrives via onStateChanged (the engine assigns its id). */
   addVbanStrip(label: string, config: VbanRecv): Promise<void>;
   setStripVban(stripId: number, label: string, config: VbanRecv): Promise<void>;
-  /** Only VBAN strips can be removed. */
   removeStrip(stripId: number): Promise<void>;
+  /** "hardware" captures the default input; "virtual" is a new playback device. */
+  addStrip(kind: "hardware" | "virtual", label: string): Promise<void>;
+  /** Adds the next free A (output: true) or B bus. */
+  addBus(output: boolean): Promise<void>;
+  removeBus(bus: BusId): Promise<void>;
+  setLabel(target: Target, label: string): Promise<void>;
   setDefaultOutput(on: boolean): Promise<void>;
   getAutostart(): Promise<boolean>;
   setAutostart(on: boolean): Promise<void>;
@@ -73,6 +78,10 @@ function tauriIpc(): Ipc {
     addVbanStrip: (label, config) => invoke("add_vban_strip", { label, config }),
     setStripVban: (stripId, label, config) => invoke("set_strip_vban", { stripId, label, config }),
     removeStrip: (stripId) => invoke("remove_strip", { stripId }),
+    addStrip: (kind, label) => invoke("add_strip", { kind, label }),
+    addBus: (output) => invoke("add_bus", { output }),
+    removeBus: (bus) => invoke("remove_bus", { bus }),
+    setLabel: (target, label) => invoke("set_label", { target, label }),
     setDefaultOutput: (on) => invoke("set_default_output", { on }),
     getAutostart: () => invoke("get_autostart"),
     setAutostart: (on) => invoke("set_autostart", { on }),

@@ -1,7 +1,14 @@
 /** Mirrors crates/lm-protocol (serde-renamed to camelCase at the IPC boundary). */
 
-export type BusId = "A1" | "A2" | "B1" | "B2";
-export const BUS_IDS: BusId[] = ["A1", "A2", "B1", "B2"];
+/** VoiceMeeter Potato's bus slots: A = hardware outputs, B = virtual sources.
+ *  A profile holds any subset, in this order. */
+export type BusId = "A1" | "A2" | "A3" | "A4" | "A5" | "B1" | "B2" | "B3";
+export const BUS_IDS: BusId[] = ["A1", "A2", "A3", "A4", "A5", "B1", "B2", "B3"];
+export const isOutputBus = (id: BusId): boolean => id.startsWith("A");
+
+/** Mirrors lm_protocol::MAX_STRIPS / LABEL_MAX. */
+export const MAX_STRIPS = 16;
+export const LABEL_MAX = 32;
 
 export type StripKind = "virtual" | "hardware" | "vban";
 
@@ -77,7 +84,8 @@ export interface StripState {
   gainDb: number;
   mute: boolean;
   solo: boolean;
-  routes: Record<BusId, boolean>;
+  /** Only buses that exist (or once existed) have an entry; missing = off. */
+  routes: Partial<Record<BusId, boolean>>;
   gate: GateParams;
   comp: CompParams;
   eq: EqParams;

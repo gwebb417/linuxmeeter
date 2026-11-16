@@ -21,9 +21,13 @@ OBS, or any recorder can use.
 
   ![Dynamics panel](docs/screenshot-dyn.png)
 
-- **Output buses** — A1/A2 to hardware devices, B1/B2 as **virtual
-  microphones** (post-limiter) selectable in any app
-- **Routing matrix** — A1/A2/B1/B2 toggles per strip, applied as live
+- **Output buses** — up to five A buses (A1–A5) to hardware devices and
+  three B buses (B1–B3) as **virtual microphones** (post-limiter) selectable
+  in any app; add them with **+A** / **+B**
+- **Your own layout** — add hardware or virtual strips with **+**, remove
+  any strip or bus (hover its name, click ✕ twice), double-click a name to
+  rename it
+- **Routing matrix** — one toggle per bus on every strip, applied as live
   PipeWire links; mute/solo; peak/RMS metering with clip latch at 30 fps
 - **VBAN network audio** — send any bus's post-limiter mix to
   VoiceMeeter (or any VBAN receiver) on another machine, and receive

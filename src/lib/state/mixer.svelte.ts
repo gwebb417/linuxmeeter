@@ -207,9 +207,29 @@ class MixerStore {
   }
 
   /** Not optimistic either: meter frames are index-aligned with the engine's
-   *  strip list, so the local list only changes when the engine's does. */
+   *  strip and bus lists, so the local lists only change when the engine's do. */
   removeStrip(stripId: number): void {
     void ipc.removeStrip(stripId);
+  }
+
+  addStrip(kind: "hardware" | "virtual", label = ""): void {
+    void ipc.addStrip(kind, label);
+  }
+
+  addBus(output: boolean): void {
+    void ipc.addBus(output);
+  }
+
+  removeBus(bus: BusId): void {
+    void ipc.removeBus(bus);
+  }
+
+  /** Optimistic; an empty label is rejected by the engine, which resends state. */
+  setLabel(target: Target, label: string): void {
+    const o = this.#find(target);
+    const clean = label.trim();
+    if (o && clean) o.label = clean;
+    void ipc.setLabel(target, label);
   }
 
   setDefaultOutput(on: boolean): void {

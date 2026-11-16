@@ -19,9 +19,11 @@ export async function close(): Promise<void> {
   if (IS_TAURI) await (await win()).close();
 }
 
-/** The window is non-resizable; the app sizes it to fit the strip content. */
+/** The window is non-resizable; the app sizes it to fit the strip content,
+ *  but never wider than the screen (the rack scrolls sideways past that). */
 export async function setContentSize(width: number, height: number): Promise<void> {
   if (!IS_TAURI) return;
   const { LogicalSize } = await import("@tauri-apps/api/dpi");
-  await (await win()).setSize(new LogicalSize(Math.round(width), Math.round(height)));
+  const w = Math.min(width, window.screen.availWidth || width);
+  await (await win()).setSize(new LogicalSize(Math.round(w), Math.round(height)));
 }

@@ -6,21 +6,47 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
+/// Bus slots, VoiceMeeter Potato style: A buses feed hardware outputs, B buses
+/// are virtual sources (microphones other apps can record). A profile holds
+/// any subset; `Ord` is display order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum BusId {
     A1,
     A2,
+    A3,
+    A4,
+    A5,
     B1,
     B2,
+    B3,
 }
 
 impl BusId {
-    pub const ALL: [BusId; 4] = [BusId::A1, BusId::A2, BusId::B1, BusId::B2];
+    pub const ALL: [BusId; 8] =
+        [BusId::A1, BusId::A2, BusId::A3, BusId::A4, BusId::A5, BusId::B1, BusId::B2, BusId::B3];
 
     /// Lowercase node-name fragment: `lm.bus.a1`.
     pub fn node_base(&self) -> String {
         format!("lm.bus.{}", format!("{self:?}").to_lowercase())
     }
+
+    /// A buses drive a hardware output; B buses are virtual sources.
+    pub fn is_output(&self) -> bool {
+        matches!(self, BusId::A1 | BusId::A2 | BusId::A3 | BusId::A4 | BusId::A5)
+    }
+}
+
+/// Upper bound on strips of all kinds, to keep the rack usable.
+pub const MAX_STRIPS: usize = 16;
+/// Longest label a strip or bus may carry.
+pub const LABEL_MAX: usize = 32;
+
+/// Normalize a user-entered strip/bus label: trimmed, control characters
+/// removed, at most [`LABEL_MAX`] characters. None if nothing is left.
+pub fn clean_label(raw: &str) -> Option<String> {
+    let s: String = raw.chars().filter(|c| !c.is_control()).collect::<String>().trim().chars().take(LABEL_MAX).collect();
+    let s = s.trim().to_string();
+    (!s.is_empty()).then_some(s)
 }
 
 pub type StripId = u32;
@@ -410,8 +436,18 @@ pub enum EngineCommand {
     AddVbanStrip { label: String, config: VbanRecv },
     /// Reconfigure a VBAN strip's receiver (label included).
     SetStripVban { strip: StripId, label: String, config: VbanRecv },
-    /// Remove a strip. Only VBAN strips can be removed.
+    /// Add an empty hardware (capturing the default input) or virtual strip.
+    /// VBAN strips are added with [`EngineCommand::AddVbanStrip`].
+    AddStrip { kind: StripKind, label: String },
+    /// Remove a strip of any kind.
     RemoveStrip { strip: StripId },
+    /// Add the next free A bus (`output: true`, hardware output) or B bus
+    /// (virtual source).
+    AddBus { output: bool },
+    /// Remove a bus; every route into it goes with it.
+    RemoveBus { bus: BusId },
+    /// Rename a strip or bus.
+    SetLabel { target: Target, label: String },
     /// Make the System strip the system-wide default output (VoiceMeeter
     /// style: all desktop audio flows through the mixer), or restore the
     /// previous hardware default.
@@ -612,6 +648,10 @@ mod tests {
             EngineCommand::AddVbanStrip { label: "Remote".into(), config: VbanRecv::default() },
             EngineCommand::SetStripVban { strip: 9, label: "Remote".into(), config: VbanRecv::default() },
             EngineCommand::RemoveStrip { strip: 9 },
+            EngineCommand::AddStrip { kind: StripKind::Hardware, label: "Guitar".into() },
+            EngineCommand::AddBus { output: true },
+            EngineCommand::RemoveBus { bus: BusId::A4 },
+            EngineCommand::SetLabel { target: Target::Bus { bus: BusId::B3 }, label: "Discord".into() },
             EngineCommand::Shutdown,
         ];
         for cmd in cmds {
@@ -665,10 +705,36 @@ mod tests {
         assert!(!CompParams::default().enabled);
     }
 
+    /// Potato's layout: five hardware outputs then three virtual sources, in
+    /// display order. `ALL` and `Ord` must agree, or the rack shuffles buses.
     #[test]
-    fn bus_ids_cover_two_hardware_and_two_virtual() {
-        assert_eq!(BusId::ALL.len(), 4);
-        assert_eq!(BusId::ALL, [BusId::A1, BusId::A2, BusId::B1, BusId::B2]);
+    fn bus_ids_are_five_outputs_then_three_virtual() {
+        assert_eq!(BusId::ALL.len(), 8);
+        assert!(BusId::ALL.windows(2).all(|w| w[0] < w[1]), "ALL is in display order");
+        let outputs: Vec<_> = BusId::ALL.iter().filter(|b| b.is_output()).collect();
+        assert_eq!(outputs, [&BusId::A1, &BusId::A2, &BusId::A3, &BusId::A4, &BusId::A5]);
+        assert!(!BusId::B3.is_output());
+        assert_eq!(BusId::A5.node_base(), "lm.bus.a5");
+        assert_eq!(serde_json::to_value(BusId::B3).unwrap(), "B3");
+    }
+
+    #[test]
+    fn labels_are_trimmed_bounded_and_never_empty() {
+        assert_eq!(clean_label("  Game  ").as_deref(), Some("Game"));
+        assert_eq!(clean_label("a\tb\nc").as_deref(), Some("abc"), "control characters are dropped");
+        assert_eq!(clean_label(&"x".repeat(50)).map(|s| s.len()), Some(LABEL_MAX));
+        assert_eq!(clean_label("   "), None);
+        assert_eq!(clean_label("Café ♪").as_deref(), Some("Café ♪"), "labels may be any printable text");
+    }
+
+    /// Profiles from before the extra buses carry routes for four buses only.
+    #[test]
+    fn four_bus_routes_still_deserialize() {
+        let mut v = serde_json::to_value(strip(1, StripKind::Virtual)).unwrap();
+        v["routes"] = serde_json::json!({ "A1": true, "A2": false, "B1": true, "B2": false });
+        let s: StripState = serde_json::from_value(v).unwrap();
+        assert_eq!(s.routes.get(&BusId::B1), Some(&true));
+        assert_eq!(s.routes.get(&BusId::A5), None);
     }
 
     // ---- VBAN ---------------------------------------------------------------

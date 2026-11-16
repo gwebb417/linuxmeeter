@@ -4,7 +4,7 @@ pkgver=r10
 pkgrel=1
 pkgdesc="VoiceMeeter-style virtual audio mixer for PipeWire (Tauri + Svelte)"
 arch=(x86_64)
-url="https://github.com/dslapelis/linuxmeeter"
+url="https://github.com/gwebb417/linuxmeeter"
 license=(GPL-3.0-or-later)
 depends=(
   pipewire

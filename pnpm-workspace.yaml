@@ -1,0 +1,8 @@
+# esbuild (pulled in by Vite) runs an install script. pnpm 10 and newer only
+# run install scripts they are told to, and pnpm 12 refuses to install at all
+# (ERR_PNPM_IGNORED_BUILDS) until it is. pnpm 12 reads allowBuilds; pnpm 10
+# and 11 read onlyBuiltDependencies.
+allowBuilds:
+  esbuild: true
+onlyBuiltDependencies:
+  - esbuild

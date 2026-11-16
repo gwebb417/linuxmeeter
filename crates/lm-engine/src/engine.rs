@@ -43,11 +43,7 @@ pub fn spawn() -> EngineHandle {
     let (evt_tx, evt_rx) = mpsc::channel::<EngineEvent>();
     std::thread::Builder::new()
         .name("lm-engine".into())
-        .spawn(move || {
-            if let Err(e) = run(cmd_rx, evt_tx) {
-                tracing::error!("engine thread died: {e}");
-            }
-        })
+        .spawn(move || supervise(cmd_rx, evt_tx))
         .expect("spawn engine thread");
     EngineHandle { cmd_tx, evt_rx }
 }
@@ -1382,15 +1378,62 @@ fn pipewire_library_version() -> String {
         .into_owned()
 }
 
+/// Why `run` returned.
+enum Exit {
+    /// The shell asked us to stop.
+    Shutdown,
+    /// The PipeWire daemon went away (restarted, crashed, upgraded).
+    Disconnected,
+}
+
+/// Runs the engine for the life of the process, reconnecting whenever the
+/// PipeWire daemon goes away. Every device we own lives in the daemon, so a
+/// `systemctl --user restart pipewire` takes all of them with it; without
+/// this the window stays up showing a mixer that no longer exists.
+///
+/// A reconnect rebuilds from the profile, which `run` saves on the way out,
+/// so the mixer comes back exactly as it was.
+fn supervise(cmd_rx: pipewire::channel::Receiver<EngineCommand>, evt_tx: mpsc::Sender<EngineEvent>) {
+    let mut cmd_rx = Some(cmd_rx);
+    // Whether the user has been told the mixer is down (said once, not per retry).
+    let mut down = false;
+    loop {
+        match run(&mut cmd_rx, evt_tx.clone()) {
+            Ok(Exit::Shutdown) => return,
+            Ok(Exit::Disconnected) => {
+                tracing::warn!("lost the connection to PipeWire; reconnecting");
+                let _ = evt_tx.send(EngineEvent::Error("PipeWire restarted; reconnecting…".into()));
+                down = true;
+            }
+            Err(e) => {
+                tracing::warn!("can't reach PipeWire ({e}); retrying");
+                if !down {
+                    let _ = evt_tx.send(EngineEvent::Error("can't reach PipeWire; retrying…".into()));
+                    down = true;
+                }
+            }
+        }
+        if cmd_rx.is_none() {
+            tracing::error!("engine command channel lost; stopping");
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// One connection's worth of engine. Borrows the command receiver for as
+/// long as it is attached to this connection's loop and hands it back on
+/// return, so `supervise` can attach it to the next one.
 fn run(
-    cmd_rx: pipewire::channel::Receiver<EngineCommand>,
+    cmd_slot: &mut Option<pipewire::channel::Receiver<EngineCommand>>,
     evt_tx: mpsc::Sender<EngineEvent>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Exit, Box<dyn std::error::Error>> {
     pipewire::init();
     let mainloop = MainLoopRc::new(None)?;
     let context = ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None)?;
     let registry = core.get_registry_rc()?;
+    let disconnected = Rc::new(std::cell::Cell::new(false));
 
     let pw_version = pipewire_library_version();
     let vban_rules = vban_recv_has_rules(&pw_version);
@@ -1540,19 +1583,36 @@ fn run(
             .register()
     };
 
-    // --- initial enumeration done -> build graph ---
+    // --- initial enumeration done -> build graph; daemon gone -> reconnect ---
     let _core_listener = {
         let engine = engine.clone();
+        let engine_err = engine.clone();
+        let ml = mainloop.clone();
+        let disconnected = disconnected.clone();
         core.add_listener_local()
             .done(move |_id, _seq| {
                 engine.borrow_mut().build_graph();
+            })
+            .error(move |id, _seq, res, message| {
+                // EPIPE on the core object is the socket closing under us.
+                const EPIPE: i32 = 32;
+                if id == pipewire::core::PW_ID_CORE && res == -EPIPE && !disconnected.get() {
+                    tracing::warn!("PipeWire connection closed: {message}");
+                    disconnected.set(true);
+                    let mut e = engine_err.borrow_mut();
+                    if e.built {
+                        e.save_now();
+                    }
+                    ml.quit();
+                }
             })
             .register()
     };
     core.sync(0)?;
 
     // --- commands from the Tauri side ---
-    let _attached = {
+    let cmd_rx = cmd_slot.take().ok_or("engine command channel missing")?;
+    let attached = {
         let engine = engine.clone();
         let ml = mainloop.clone();
         cmd_rx.attach(mainloop.loop_(), move |cmd| {
@@ -1599,6 +1659,17 @@ fn run(
 
     tracing::info!("engine running");
     mainloop.run();
+    *cmd_slot = Some(attached.deattach());
+    if disconnected.get() {
+        // Everything we owned died with the daemon. Drop it all here: the
+        // metadata listener holds an Rc back to the engine, so without this
+        // the old engine (modules, proxies, context) would leak per restart.
+        let mut e = engine.borrow_mut();
+        e.app.take_default_output = false; // nothing to hand back on a dead connection
+        e.unload_all();
+        e.metadata = None;
+        return Ok(Exit::Disconnected);
+    }
     // Shutdown unloaded everything just before quitting; spin the loop a few
     // more times so those disconnects reach the daemon even if the process
     // lingers (the Tauri shell exits ~200 ms later, a test harness may not).
@@ -1606,7 +1677,7 @@ fn run(
         mainloop.loop_().iterate(pipewire::loop_::Timeout::Finite(Duration::from_millis(20)));
     }
     tracing::info!("engine stopped");
-    Ok(())
+    Ok(Exit::Shutdown)
 }
 
 /// Metadata values look like `{"name":"alsa_output.foo"}`.

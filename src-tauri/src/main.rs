@@ -168,6 +168,16 @@ fn set_default_output(data: tauri::State<AppData>, on: bool) -> Result<(), Strin
 /// Start/stop meter frames to follow window visibility. Each frame costs a
 /// script evaluation in the webview plus a canvas repaint per meter, so a
 /// mixer parked in the tray should not be paying for either.
+/// Brings the mixer window back from the tray / behind other windows.
+fn show_main<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+        set_meters(app, true);
+    }
+}
+
 fn set_meters<R: tauri::Runtime, M: Manager<R>>(manager: &M, on: bool) {
     if let Some(data) = manager.try_state::<AppData>() {
         let _ = data.cmd_tx.send(EngineCommand::SetMetersEnabled { on });
@@ -217,12 +227,14 @@ fn main() {
         )
         .init();
 
-    let engine = lm_engine::engine::spawn();
-    let cmd_tx = engine.cmd_tx.clone();
     let state: Arc<RwLock<Option<AppState>>> = Arc::new(RwLock::new(None));
 
     tauri::Builder::default()
-        .manage(AppData { cmd_tx: engine.cmd_tx.clone(), state: state.clone() })
+        // Must be the first plugin. A second launch hands over to the running
+        // mixer (shows its window) and exits before `setup` runs, so it never
+        // starts an engine: two engines create identically named devices and
+        // tear each other's graphs apart.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
         .invoke_handler(tauri::generate_handler![
             get_state,
             set_gain,
@@ -255,6 +267,9 @@ fn main() {
             set_autostart,
         ])
         .setup(move |app| {
+            let engine = lm_engine::engine::spawn();
+            app.manage(AppData { cmd_tx: engine.cmd_tx.clone(), state: state.clone() });
+
             // Pump engine events into the webview.
             let handle = app.handle().clone();
             let evt_rx = engine.evt_rx;
@@ -289,14 +304,7 @@ fn main() {
                 .menu(&menu)
                 .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => {
-                        if let Some(w) = app.get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.unminimize();
-                            let _ = w.set_focus();
-                            set_meters(app, true);
-                        }
-                    }
+                    "show" => show_main(app),
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -321,11 +329,13 @@ fn main() {
         })
         .build(tauri::generate_context!())
         .expect("error building linuxmeeter")
-        .run(move |_app, event| {
+        .run(move |app, event| {
             if let tauri::RunEvent::Exit = event {
                 // Graceful engine shutdown -> modules unload -> zero lm.* nodes left.
-                let _ = cmd_tx.send(EngineCommand::Shutdown);
-                std::thread::sleep(Duration::from_millis(200));
+                if let Some(data) = app.try_state::<AppData>() {
+                    let _ = data.cmd_tx.send(EngineCommand::Shutdown);
+                    std::thread::sleep(Duration::from_millis(200));
+                }
             }
         });
 }

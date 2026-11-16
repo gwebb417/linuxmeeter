@@ -10,6 +10,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-single-instance = "~2.4"  # 2.5 needs tauri 2.12; @tauri-apps/api is 2.11
 lm-protocol = { path = "../crates/lm-protocol" }
 lm-engine = { path = "../crates/lm-engine" }
 pipewire = "0.10"

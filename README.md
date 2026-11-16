@@ -59,8 +59,10 @@ OBS, or any recorder can use.
 
 ## Requirements
 
-- PipeWire ≥ 1.0 with WirePlumber (the pulse compatibility layer is used by
-  most apps, but linuxmeeter itself talks native PipeWire)
+- PipeWire ≥ 1.4 with WirePlumber (the pulse compatibility layer is used by
+  most apps, but linuxmeeter itself talks native PipeWire). The filter-chain
+  module must be built with LV2 support: Ubuntu 24.04's PipeWire 1.0.5 is
+  not, so no strip or bus can load there
 - `lsp-plugins-lv2` (gate/compressor/EQ/limiter DSP)
 - `webkit2gtk-4.1`, `gtk3`, `libayatana-appindicator` (UI shell + tray)
 
@@ -72,7 +74,8 @@ pnpm tauri dev          # development (mixer runs against your live graph)
 pnpm tauri build --no-bundle   # release binary at target/release/linuxmeeter
 ```
 
-Arch users: see `packaging/PKGBUILD`.
+`pnpm tauri build` (with bundling) also produces a `.deb` under
+`target/release/bundle/deb/`. Arch users: see `packaging/PKGBUILD`.
 
 ## Development notes
 

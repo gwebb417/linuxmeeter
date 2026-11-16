@@ -269,5 +269,6 @@ plus on shutdown. `sanitize()` clears state that must not survive a restart (sol
 - Default-output takeover writes the `default.configured.audio.sink` metadata key. The
   metadata listener deliberately ignores values starting with `lm.` so the remembered
   hardware default (used for restore) survives while we are the default.
-- Runtime deps that must exist on the machine: PipeWire ≥ 1.0 + WirePlumber,
+- Runtime deps that must exist on the machine: PipeWire ≥ 1.4 (its filter-chain must have
+  LV2 support — Ubuntu 24.04's 1.0.5 does not, so every strip fails to load) + WirePlumber,
   `lsp-plugins-lv2`, `webkit2gtk-4.1`, `gtk3`, `libayatana-appindicator`.

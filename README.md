@@ -28,6 +28,9 @@ OBS, or any recorder can use.
   which buses it feeds, reverb decay and damping, and echo time and feedback.
   Both run on PipeWire's built-in filters (the reverb's impulse response is
   generated on the fly), so no extra plugins are needed
+
+  ![FX panel](docs/screenshot-fx.png)
+
 - **Macro buttons** — a bar of pads (**MACROS** in the top bar) that each
   run a list of actions: mute, solo, route, set a fader, mute an effect
   return, start/stop a VBAN output, or toggle Default out. **Toggle** pads
@@ -48,6 +51,9 @@ OBS, or any recorder can use.
   VBAN streams as their own input strips with full DSP and routing. Built
   on PipeWire's native `vban-send` / `vban-recv` modules; configure it from
   the **VBAN** button in the top bar
+
+  ![VBAN panel](docs/screenshot-vban.png)
+
 - **Default-output takeover** — one click makes the System strip your
   default sink so *all* desktop audio flows through the mixer
 - **Profiles** — everything persists to `~/.config/linuxmeeter/` (TOML,
